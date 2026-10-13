@@ -1,4 +1,4 @@
-# valkvedge for TypeScript and JavaScript
+# @valkv/edgekv for TypeScript and JavaScript
 
 A client for ValkvEdgeKV. It talks to the service over HTTPS with an API key; it keeps
 no local copy, so every read and write is a request. For a local replica that works
@@ -12,7 +12,7 @@ repository root type-checks, tests and builds it into `dist/`.
 ## Use
 
 ```ts
-import { EdgeKV } from 'valkvedge'
+import { EdgeKV } from '@valkv/edgekv'
 
 const kv = new EdgeKV({
   apiKey: process.env.EDGEKV_API_KEY!,   // ekv_…, from the portal
@@ -103,7 +103,7 @@ should carry an ordinary key, or one limited to a single database.
 Every failure is an `EdgeKVError` with a stable `code`, the HTTP `status`, and a message.
 
 ```ts
-import { EdgeKVError } from 'valkvedge'
+import { EdgeKVError } from '@valkv/edgekv'
 
 try {
   await db.put('k', 'v')

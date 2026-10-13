@@ -3,15 +3,15 @@
 Client SDKs (TypeScript, Python) and the desktop app for ValkvEdgeKV, the local-first
 key-value database.
 
-**Status:** the TypeScript SDK is built and tested; it is not published to npm yet. The
-Python SDK and the desktop application are not started.
+**Status:** the TypeScript and Python SDKs are built and tested. Neither is published
+to a package registry yet. The desktop application is not started.
 
 ## Layout
 
 | Folder | What | State |
 |---|---|---|
-| [`typescript/`](typescript/README.md) | TypeScript and JavaScript SDK: reads, writes, scans, waiting for changes, and managing databases | Built |
-| `python/` | Python SDK | Planned |
+| [`typescript/`](typescript/README.md) | `@valkv/edgekv` for TypeScript and JavaScript: reads, writes, scans, waiting for changes, and managing databases | Built |
+| [`python/`](python/README.md) | `valkv-edgekv` for Python: the same, with the same names in Python style | Built |
 | `desktop/` | Desktop application (Tauri) for macOS and Windows: browse a database and its contents, create and delete databases | Planned |
 
 ## What this code talks to
@@ -25,9 +25,16 @@ databases when it was created, they also list, create and delete databases.
 Everything runs in Docker; `make` lists the commands.
 
 ```sh
-make ts-test     # TypeScript SDK: type-check, unit tests, build
-make ts-integ    # the same SDK against a running service
+make test        # both SDKs: unit tests, no network
+make integ EDGEKV_URL=… EDGEKV_CONTROL_URL=… EDGEKV_API_KEY=ekv_…   # both, against a running service
 ```
+
+`ts-test`, `ts-integ`, `py-test` and `py-integ` run one SDK at a time.
+
+## Licence
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT licence](LICENSE-MIT) at your option, the same as the library.
 
 ## Rules
 

@@ -1,8 +1,8 @@
 {
-  "name": "valkvedge",
+  "name": "@valkv/edgekv",
   "version": "0.1.0",
   "description": "Client for ValkvEdgeKV, the local-first key-value database",
-  "private": true,
+  "license": "MIT OR Apache-2.0",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
