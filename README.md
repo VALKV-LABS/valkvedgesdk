@@ -3,8 +3,8 @@
 Client SDKs (TypeScript, Python) and the desktop app for ValkvEdgeKV, the local-first
 key-value database.
 
-**Status:** the TypeScript and Python SDKs are built and tested. Neither is published
-to a package registry yet. The desktop application is not started.
+**Status:** the TypeScript and Python SDKs and the desktop application are built and
+tested. None is published yet.
 
 ## Layout
 
@@ -12,7 +12,7 @@ to a package registry yet. The desktop application is not started.
 |---|---|---|
 | [`typescript/`](typescript/README.md) | `@valkv/edgekv` for TypeScript and JavaScript: reads, writes, scans, waiting for changes, and managing databases | Built |
 | [`python/`](python/README.md) | `valkv-edgekv` for Python: the same, with the same names in Python style | Built |
-| `desktop/` | Desktop application (Tauri) for macOS and Windows: browse a database and its contents, create and delete databases | Planned |
+| [`desktop/`](desktop/README.md) | Desktop application (Tauri) for Windows and macOS: browse a database and its contents, create and delete databases | Built and tested on Windows; no release yet |
 
 ## What this code talks to
 

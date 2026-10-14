@@ -1,0 +1,224 @@
+name: Desktop release
+
+# Builds the desktop application for Windows and macOS and, when asked,
+# attaches the installers to a GitHub Release of this repository.
+#
+#   1. Set the version in desktop/package.json, desktop/src-tauri/tauri.conf.json
+#      and desktop/src-tauri/Cargo.toml, and merge.
+#   2. Run this workflow with the tag, for example desktop-v0.1.0.
+#      With "publish" off it only builds, and the installers are kept as
+#      workflow artifacts: use that to try a build before releasing it.
+#
+# Signing is optional. Without the secrets below the installers are built
+# unsigned, and Windows and macOS will warn the person installing them.
+#   Windows: WINDOWS_CERTIFICATE (base64 .pfx), WINDOWS_CERTIFICATE_PASSWORD
+#   macOS:   APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
+#            KEYCHAIN_PASSWORD, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example desktop-v0.1.0
+        required: true
+        type: string
+      publish:
+        description: Attach the installers to a GitHub Release
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: desktop
+
+jobs:
+  check:
+    name: Tag and version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag names the version the files carry
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG#refs/tags/}"
+          case "$tag" in
+            desktop-v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::'$tag' is not a desktop-vX.Y.Z tag"; exit 1 ;;
+          esac
+          version="${tag#desktop-v}"
+          in_package=$(jq -r .version package.json)
+          in_tauri=$(jq -r .version src-tauri/tauri.conf.json)
+          in_cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -1)
+          for found in "$in_package" "$in_tauri" "$in_cargo"; do
+            if [ "$found" != "$version" ]; then
+              echo "::error::the tag says $version but the files say package.json=$in_package tauri.conf.json=$in_tauri Cargo.toml=$in_cargo"
+              exit 1
+            fi
+          done
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows installers
+    runs-on: windows-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - run: npm ci
+
+      - name: Checks
+        run: |
+          npm run typecheck
+          npm test
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Build
+        run: npm run tauri build
+
+      - name: Sign the installers
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        shell: powershell
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) { Write-Host "No certificate secret: the installers are left unsigned."; exit 0 }
+          $pfxPath = "$env:TEMP\codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          $files = @(Get-ChildItem "src-tauri\target\release\bundle\msi\*.msi") +
+                   @(Get-ChildItem "src-tauri\target\release\bundle\nsis\*.exe")
+          foreach ($f in $files) {
+            & $signtool sign /f $pfxPath /p $env:WINDOWS_CERTIFICATE_PASSWORD `
+              /tr http://timestamp.digicert.com /td sha256 /fd sha256 $f.FullName
+            if ($LASTEXITCODE -ne 0) { Remove-Item $pfxPath -Force; exit 1 }
+          }
+          Remove-Item $pfxPath -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edgekv-desktop-windows
+          if-no-files-found: error
+          path: |
+            desktop/src-tauri/target/release/bundle/msi/*.msi
+            desktop/src-tauri/target/release/bundle/nsis/*.exe
+
+  macos:
+    name: macOS, Apple Silicon
+    runs-on: macos-15
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - run: npm ci
+
+      - name: Checks
+        run: |
+          npm run typecheck
+          npm test
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Import the signing certificate
+        if: env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm certificate.p12
+
+      - name: Build
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run tauri build -- --target aarch64-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edgekv-desktop-macos
+          if-no-files-found: error
+          path: desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+
+  publish:
+    name: Publish the release
+    runs-on: ubuntu-latest
+    needs: [check, windows, macos]
+    if: inputs.publish
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: installers
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd installers
+          find . -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' \) -print0 | xargs -0 sha256sum | sed 's# \./.*/# #' > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.tag }}
+          name: ValkvEdgeKV Desktop ${{ needs.check.outputs.version }}
+          body: |
+            ValkvEdgeKV Desktop ${{ needs.check.outputs.version }}: browse a database and its contents, and create and delete databases.
+
+            - Windows: the `-setup.exe` installer, or the `.msi`.
+            - macOS (Apple Silicon): the `.dmg`.
+
+            `SHA256SUMS.txt` lists the checksum of each file.
+          fail_on_unmatched_files: true
+          files: |
+            installers/**/*.msi
+            installers/**/*.exe
+            installers/**/*.dmg
+            installers/SHA256SUMS.txt
