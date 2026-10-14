@@ -5,3 +5,5 @@ __pycache__
 .venv
 target
 .env
+desktop/tests/out
+desktop/src-tauri/gen
