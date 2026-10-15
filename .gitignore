@@ -7,3 +7,4 @@ target
 .env
 desktop/tests/out
 desktop/src-tauri/gen
+*.node

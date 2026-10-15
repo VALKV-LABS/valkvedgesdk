@@ -1,0 +1,263 @@
+name: npm
+
+# Builds the native library behind the local mode of @valkv/edgekv for every
+# platform, tests each build, and, when asked, publishes @valkv/edgekv and its
+# platform packages to npm.
+#
+# `npm install @valkv/edgekv` then installs the client and, as an optional
+# dependency chosen by os, cpu and libc, the one native library for the
+# machine it runs on. Nobody installing it needs Rust.
+#
+#   1. Set the version everywhere: in typescript/, `npm run version:set 0.2.0`.
+#      Merge that.
+#   2. Run this workflow with the tag, for example ts-v0.2.0.
+#      With "publish" off it only builds and tests: use that to try a release.
+#      A version like 0.2.0-beta.1 is published under the dist-tag "next",
+#      so `npm install @valkv/edgekv` keeps getting the last release.
+#
+# Publishing needs the secret NPM_TOKEN: an npm token that may publish to the
+# @valkv scope. Re-running a publish skips packages already on npm, so a run
+# that failed half-way can be run again.
+
+on:
+  pull_request:
+    paths:
+      - native/**
+      - typescript/**
+      - .github/workflows/npm.yml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example ts-v0.2.0
+        required: true
+        type: string
+      publish:
+        description: Publish to npm and create a GitHub Release
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Tag and version
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      dist_tag: ${{ steps.tag.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag names the version every package carries
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG#refs/tags/}"
+          case "$tag" in
+            ts-v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::'$tag' is not a ts-vX.Y.Z tag"; exit 1 ;;
+          esac
+          version="${tag#ts-v}"
+          node typescript/scripts/version.mjs check "$version"
+          case "$version" in *-*) dist_tag=next ;; *) dist_tag=latest ;; esac
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "dist_tag=$dist_tag"
+          } >> "$GITHUB_OUTPUT"
+
+  # Linux builds run in containers, the same way `make native-gnu` and
+  # `make native-musl` do: glibc builds link against glibc 2.17 (zig), musl
+  # builds are made on Alpine. Each runs on a runner of its own architecture,
+  # so its tests run on the build itself.
+  linux:
+    name: Native, ${{ matrix.suffix }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { suffix: linux-x64-gnu, runner: ubuntu-latest, libc: gnu, rust: "rust:1-bookworm", node: "node:22-bookworm-slim" }
+          - { suffix: linux-arm64-gnu, runner: ubuntu-24.04-arm, libc: gnu, rust: "rust:1-bookworm", node: "node:22-bookworm-slim" }
+          - { suffix: linux-x64-musl, runner: ubuntu-latest, libc: musl, rust: "rust:1-alpine", node: "node:22-alpine" }
+          - { suffix: linux-arm64-musl, runner: ubuntu-24.04-arm, libc: musl, rust: "rust:1-alpine", node: "node:22-alpine" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          docker run --rm -v "$PWD/native:/src" -v "$PWD/typescript/npm:/npm" -w /src \
+            -e CARGO_TARGET_DIR=/target ${{ matrix.rust }} sh build-linux.sh ${{ matrix.libc }}
+
+      - name: Rust format, lint and tests
+        if: matrix.suffix == 'linux-x64-gnu'
+        run: |
+          docker run --rm -v "$PWD/native:/src" -w /src -e CARGO_TARGET_DIR=/target ${{ matrix.rust }} sh -c \
+            "rustup component add rustfmt clippy && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked"
+
+      - name: Local mode tests on this build
+        run: docker run --rm -v "$PWD/typescript:/app" -w /app ${{ matrix.node }} sh scripts/test-local.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.suffix }}
+          path: typescript/npm/${{ matrix.suffix }}/edgekv.${{ matrix.suffix }}.node
+          if-no-files-found: error
+
+  others:
+    name: Native, ${{ matrix.suffix }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { suffix: darwin-arm64, runner: macos-15, target: aarch64-apple-darwin, lib: libedgekv_native.dylib, test: true }
+          # Cross-compiled on Apple Silicon. There is no Intel runner here to run it on.
+          - { suffix: darwin-x64, runner: macos-15, target: x86_64-apple-darwin, lib: libedgekv_native.dylib, test: false }
+          - { suffix: win32-x64-msvc, runner: windows-latest, target: x86_64-pc-windows-msvc, lib: edgekv_native.dll, test: true }
+    defaults:
+      run:
+        shell: bash
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: |
+          cargo build --release --locked --manifest-path native/Cargo.toml --target ${{ matrix.target }}
+          cp "native/target/${{ matrix.target }}/release/${{ matrix.lib }}" \
+             "typescript/npm/${{ matrix.suffix }}/edgekv.${{ matrix.suffix }}.node"
+
+      - uses: actions/setup-node@v4
+        if: matrix.test
+        with:
+          node-version: "22"
+
+      - name: Local mode tests on this build
+        if: matrix.test
+        run: sh typescript/scripts/test-local.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.suffix }}
+          path: typescript/npm/${{ matrix.suffix }}/edgekv.${{ matrix.suffix }}.node
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    needs: [check, linux, others]
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # the GitHub Release
+      id-token: write   # npm provenance: each package records the run that built it
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      DIST_TAG: ${{ needs.check.outputs.dist_tag }}
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: artifacts
+
+      - name: Put each library in its package
+        run: |
+          set -euo pipefail
+          for dir in typescript/npm/*/; do
+            suffix="$(basename "$dir")"
+            built="artifacts/native-$suffix/edgekv.$suffix.node"
+            if [ ! -f "$built" ]; then echo "::error::no build for $suffix"; exit 1; fi
+            cp "$built" "$dir"
+            cp LICENSE-MIT LICENSE-APACHE "$dir"
+          done
+          cp LICENSE-MIT LICENSE-APACHE typescript/
+
+      # Every platform package first: the main package names them, and must
+      # not reach npm before they do.
+      - name: Publish the platform packages
+        run: |
+          set -euo pipefail
+          for dir in typescript/npm/*/; do
+            name="$(jq -r .name "$dir/package.json")"
+            if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+              echo "$name@$VERSION is already on npm"
+            else
+              npm publish "$dir" --access public --provenance --tag "$DIST_TAG"
+            fi
+          done
+
+      - name: Publish @valkv/edgekv
+        working-directory: typescript
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run build
+          npm test
+          if npm view "@valkv/edgekv@$VERSION" version >/dev/null 2>&1; then
+            echo "@valkv/edgekv@$VERSION is already on npm"
+          else
+            npm publish --access public --provenance --tag "$DIST_TAG"
+          fi
+
+      - name: Install it from npm and use the local mode
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/try" && cd "$RUNNER_TEMP/try"
+          npm init -y >/dev/null
+          # A new version can take a minute to be visible to installs.
+          for attempt in 1 2 3 4 5 6; do
+            npm install --no-audit --no-fund "@valkv/edgekv@$VERSION" && break
+            [ "$attempt" = 6 ] && exit 1
+            sleep 20
+          done
+          ls node_modules/@valkv
+          cat > try.mjs <<'EOF'
+          import { LocalEdgeKV } from '@valkv/edgekv'
+          const kv = await LocalEdgeKV.open({ path: './kv' })
+          const db = await kv.database('smoke')
+          await db.put('hello', 'world')
+          if ((await db.getText('hello')) !== 'world') throw new Error('read back the wrong value')
+          await kv.close()
+          console.log('local mode works from the published package')
+          EOF
+          node try.mjs
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "@valkv/edgekv ${{ needs.check.outputs.version }}"
+          prerelease: ${{ needs.check.outputs.dist_tag == 'next' }}
+          body: |
+            `npm install @valkv/edgekv@${{ needs.check.outputs.version }}`
+
+            Installs the client and the native library for the local mode on macOS (Apple Silicon and Intel),
+            Linux (x64 and arm64, glibc and musl) and Windows (x64).
