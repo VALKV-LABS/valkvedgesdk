@@ -1,8 +1,8 @@
 name: npm
 
 # Builds the native library behind the local mode of @valkvlabs/edgekv for every
-# platform, tests each build, and, when asked, publishes @valkvlabs/edgekv and its
-# platform packages to npm.
+# platform, tests each build, and, when asked, stages @valkvlabs/edgekv and its
+# platform packages on npm for a maintainer to approve.
 #
 # `npm install @valkvlabs/edgekv` then installs the client and, as an optional
 # dependency chosen by os, cpu and libc, the one native library for the
@@ -10,14 +10,23 @@ name: npm
 #
 #   1. Set the version everywhere: in typescript/, `npm run version:set 0.2.0`.
 #      Merge that.
-#   2. Run this workflow with the tag, for example ts-v0.2.0.
-#      With "publish" off it only builds and tests: use that to try a release.
-#      A version like 0.2.0-beta.1 is published under the dist-tag "next",
-#      so `npm install @valkvlabs/edgekv` keeps getting the last release.
+#   2. Run this workflow with the tag, for example ts-v0.2.0. With "stage" off
+#      it only builds and tests: use that to try a release.
+#   3. With "stage" on, it stages all eight packages. Nothing is public yet.
+#      The run's summary lists them. Approve them, with 2FA, platform
+#      packages first and @valkvlabs/edgekv last:
+#        npm stage approve <stage-id> --otp <code>     (npm 11 or later)
+#   4. Run the "npm release check" workflow with the same tag: it installs the
+#      release from npm on Linux, macOS and Windows, and creates the GitHub
+#      Release.
 #
-# Publishing needs the secret NPM_TOKEN: an npm token that may publish to the
-# @valkvlabs scope. Re-running a publish skips packages already on npm, so a run
-# that failed half-way can be run again.
+# A version like 0.2.0-beta.1 is staged under the dist-tag "next", so
+# `npm install @valkvlabs/edgekv` keeps getting the last release.
+#
+# Staging needs the secret NPM_TOKEN: an npm token with "Read and write
+# (stage only)" for the @valkvlabs scope. It cannot make anything public on
+# its own. Re-running skips packages already published or staged at this
+# version, so a run that failed half-way can be run again.
 
 on:
   pull_request:
@@ -31,8 +40,8 @@ on:
         description: Release tag, for example ts-v0.2.0
         required: true
         type: string
-      publish:
-        description: Publish to npm and create a GitHub Release
+      stage:
+        description: Stage the packages on npm for approval
         required: true
         default: false
         type: boolean
@@ -163,13 +172,13 @@ jobs:
           path: typescript/npm/${{ matrix.suffix }}/edgekv.${{ matrix.suffix }}.node
           if-no-files-found: error
 
-  publish:
-    name: Publish to npm
+  stage:
+    name: Stage on npm
     needs: [check, linux, others]
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    if: github.event_name == 'workflow_dispatch' && inputs.stage
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # the GitHub Release
+      contents: read
       id-token: write   # npm provenance: each package records the run that built it
     env:
       VERSION: ${{ needs.check.outputs.version }}
@@ -182,6 +191,9 @@ jobs:
         with:
           node-version: "22"
           registry-url: https://registry.npmjs.org
+
+      # `npm stage` arrived in npm 11.
+      - run: npm install -g npm@11 && npm --version
 
       - uses: actions/download-artifact@v4
         with:
@@ -200,64 +212,46 @@ jobs:
           done
           cp LICENSE-MIT LICENSE-APACHE typescript/
 
-      # Every platform package first: the main package names them, and must
-      # not reach npm before they do.
-      - name: Publish the platform packages
-        run: |
-          set -euo pipefail
-          for dir in typescript/npm/*/; do
-            name="$(jq -r .name "$dir/package.json")"
-            if npm view "$name@$VERSION" version >/dev/null 2>&1; then
-              echo "$name@$VERSION is already on npm"
-            else
-              npm publish "$dir" --access public --provenance --tag "$DIST_TAG"
-            fi
-          done
-
-      - name: Publish @valkvlabs/edgekv
+      - name: Build @valkvlabs/edgekv
         working-directory: typescript
         run: |
-          set -euo pipefail
           npm ci --no-audit --no-fund
           npm run build
           npm test
-          if npm view "@valkvlabs/edgekv@$VERSION" version >/dev/null 2>&1; then
-            echo "@valkvlabs/edgekv@$VERSION is already on npm"
-          else
-            npm publish --access public --provenance --tag "$DIST_TAG"
-          fi
 
-      - name: Install it from npm and use the local mode
+      # Platform packages first, so the summary lists them in the order to
+      # approve them: @valkvlabs/edgekv names them, and must not go public
+      # before they do.
+      - name: Stage every package
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/try" && cd "$RUNNER_TEMP/try"
-          npm init -y >/dev/null
-          # A new version can take a minute to be visible to installs.
-          for attempt in 1 2 3 4 5 6; do
-            npm install --no-audit --no-fund "@valkvlabs/edgekv@$VERSION" && break
-            [ "$attempt" = 6 ] && exit 1
-            sleep 20
+          summary="$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Staged @valkvlabs/edgekv $VERSION"
+            echo
+            echo "Nothing is public until approved. Approve with 2FA, platform packages first and \`@valkvlabs/edgekv\` last:"
+            echo
+            echo '```sh'
+            echo 'npm stage approve <stage-id> --otp <code>'
+            echo '```'
+          } >> "$summary"
+          for dir in typescript/npm/*/ typescript/; do
+            name="$(jq -r .name "$dir/package.json")"
+            echo "::group::$name@$VERSION"
+            if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+              echo "already published"
+            elif npm stage list "$name" 2>/dev/null | grep -qF "$VERSION"; then
+              echo "already staged"
+            else
+              (cd "$dir" && npm stage publish --access public --provenance --tag "$DIST_TAG")
+            fi
+            echo "::endgroup::"
+            {
+              echo
+              echo "### \`$name\`"
+              echo
+              echo '```'
+              npm stage list "$name" 2>&1 || true
+              echo '```'
+            } >> "$summary"
           done
-          ls node_modules/@valkvlabs
-          cat > try.mjs <<'EOF'
-          import { LocalEdgeKV } from '@valkvlabs/edgekv'
-          const kv = await LocalEdgeKV.open({ path: './kv' })
-          const db = await kv.database('smoke')
-          await db.put('hello', 'world')
-          if ((await db.getText('hello')) !== 'world') throw new Error('read back the wrong value')
-          await kv.close()
-          console.log('local mode works from the published package')
-          EOF
-          node try.mjs
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.check.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: "@valkvlabs/edgekv ${{ needs.check.outputs.version }}"
-          prerelease: ${{ needs.check.outputs.dist_tag == 'next' }}
-          body: |
-            `npm install @valkvlabs/edgekv@${{ needs.check.outputs.version }}`
-
-            Installs the client and the native library for the local mode on macOS (Apple Silicon and Intel),
-            Linux (x64 and arm64, glibc and musl) and Windows (x64).

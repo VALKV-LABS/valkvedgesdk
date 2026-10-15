@@ -271,10 +271,26 @@ EDGEKV_NATIVE_PATH=../native/target/release/libedgekv_native.dylib npm run test:
 ### Releasing
 
 The [npm workflow](../.github/workflows/npm.yml) builds the native library on every
-platform, tests each build, and publishes `@valkvlabs/edgekv` with its seven platform
-packages, all at one version:
+platform, tests each build, and stages `@valkvlabs/edgekv` with its seven platform
+packages on npm, all at one version. Nothing goes public until a maintainer approves
+it with 2FA.
 
 1. `npm run version:set 0.2.0` here, and merge.
-2. Run the workflow with tag `ts-v0.2.0`: first with "publish" off to try it, then on.
+2. Run the **npm** workflow with tag `ts-v0.2.0`: first with "stage" off to try it,
+   then on.
+3. Approve the eight staged versions: the platform packages first, `@valkvlabs/edgekv`
+   last, so nobody installs it before its native builds exist. The run's summary lists
+   them; so does `npm stage list @valkvlabs/edgekv`. With npm 11 or later:
 
-It needs the repository secret `NPM_TOKEN`, an npm token that may publish to `@valkvlabs`.
+   ```sh
+   npm stage approve <stage-id> --otp <code>
+   ```
+
+   A version that is wrong can be dropped instead: `npm stage reject <stage-id>`.
+4. Run the **npm release check** workflow with the same tag. It installs the release
+   from npm on Linux (glibc and musl, x64 and arm64), macOS and Windows, uses the local
+   mode, and creates the GitHub Release.
+
+The workflow needs the repository secret `NPM_TOKEN`: an npm granular token with
+"Read and write (stage only)" for `@valkvlabs`. It can stage but never make anything
+public by itself.

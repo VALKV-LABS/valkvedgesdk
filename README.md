@@ -37,7 +37,7 @@ builds the native library for Linux and runs the TypeScript local mode on it.
 
 | What | Workflow | Where it goes |
 |---|---|---|
-| `@valkvlabs/edgekv` and its platform packages | [`npm.yml`](.github/workflows/npm.yml), tag `ts-vX.Y.Z` | npm |
+| `@valkvlabs/edgekv` and its platform packages | [`npm.yml`](.github/workflows/npm.yml) stages them, a maintainer approves with 2FA, then [`npm-release-check.yml`](.github/workflows/npm-release-check.yml); tag `ts-vX.Y.Z` | npm |
 | Desktop application | [`desktop-release.yml`](.github/workflows/desktop-release.yml), tag `desktop-vX.Y.Z` | GitHub Releases |
 
 ## Licence
