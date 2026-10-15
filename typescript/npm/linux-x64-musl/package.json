@@ -1,0 +1,27 @@
+{
+  "name": "@valkvlabs/edgekv-linux-x64-musl",
+  "version": "0.1.0",
+  "description": "The linux-x64-musl build of the native library behind @valkvlabs/edgekv. Install @valkvlabs/edgekv, not this.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VALKV-LABS/valkvedgesdk.git",
+    "directory": "typescript/npm/linux-x64-musl"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "musl"
+  ],
+  "main": "edgekv.linux-x64-musl.node",
+  "files": [
+    "edgekv.linux-x64-musl.node"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

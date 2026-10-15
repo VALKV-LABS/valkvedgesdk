@@ -1,0 +1,257 @@
+name: npm
+
+# Builds the native library behind the local mode of @valkvlabs/edgekv for every
+# platform, tests each build, and, when asked, stages @valkvlabs/edgekv and its
+# platform packages on npm for a maintainer to approve.
+#
+# `npm install @valkvlabs/edgekv` then installs the client and, as an optional
+# dependency chosen by os, cpu and libc, the one native library for the
+# machine it runs on. Nobody installing it needs Rust.
+#
+#   1. Set the version everywhere: in typescript/, `npm run version:set 0.2.0`.
+#      Merge that.
+#   2. Run this workflow with the tag, for example ts-v0.2.0. With "stage" off
+#      it only builds and tests: use that to try a release.
+#   3. With "stage" on, it stages all eight packages. Nothing is public yet.
+#      The run's summary lists them. Approve them, with 2FA, platform
+#      packages first and @valkvlabs/edgekv last:
+#        npm stage approve <stage-id> --otp <code>     (npm 11 or later)
+#   4. Run the "npm release check" workflow with the same tag: it installs the
+#      release from npm on Linux, macOS and Windows, and creates the GitHub
+#      Release.
+#
+# A version like 0.2.0-beta.1 is staged under the dist-tag "next", so
+# `npm install @valkvlabs/edgekv` keeps getting the last release.
+#
+# Staging needs the secret NPM_TOKEN: an npm token with "Read and write
+# (stage only)" for the @valkvlabs scope. It cannot make anything public on
+# its own. Re-running skips packages already published or staged at this
+# version, so a run that failed half-way can be run again.
+
+on:
+  pull_request:
+    paths:
+      - native/**
+      - typescript/**
+      - .github/workflows/npm.yml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example ts-v0.2.0
+        required: true
+        type: string
+      stage:
+        description: Stage the packages on npm for approval
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Tag and version
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      dist_tag: ${{ steps.tag.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag names the version every package carries
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG#refs/tags/}"
+          case "$tag" in
+            ts-v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::'$tag' is not a ts-vX.Y.Z tag"; exit 1 ;;
+          esac
+          version="${tag#ts-v}"
+          node typescript/scripts/version.mjs check "$version"
+          case "$version" in *-*) dist_tag=next ;; *) dist_tag=latest ;; esac
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "dist_tag=$dist_tag"
+          } >> "$GITHUB_OUTPUT"
+
+  # Linux builds run in containers, the same way `make native-gnu` and
+  # `make native-musl` do: glibc builds link against glibc 2.17 (zig), musl
+  # builds are made on Alpine. Each runs on a runner of its own architecture,
+  # so its tests run on the build itself.
+  linux:
+    name: Native, ${{ matrix.suffix }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { suffix: linux-x64-gnu, runner: ubuntu-latest, libc: gnu, rust: "rust:1-bookworm", node: "node:22-bookworm-slim" }
+          - { suffix: linux-arm64-gnu, runner: ubuntu-24.04-arm, libc: gnu, rust: "rust:1-bookworm", node: "node:22-bookworm-slim" }
+          - { suffix: linux-x64-musl, runner: ubuntu-latest, libc: musl, rust: "rust:1-alpine", node: "node:22-alpine" }
+          - { suffix: linux-arm64-musl, runner: ubuntu-24.04-arm, libc: musl, rust: "rust:1-alpine", node: "node:22-alpine" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          docker run --rm -v "$PWD/native:/src" -v "$PWD/typescript/npm:/npm" -w /src \
+            -e CARGO_TARGET_DIR=/target ${{ matrix.rust }} sh build-linux.sh ${{ matrix.libc }}
+
+      - name: Rust format, lint and tests
+        if: matrix.suffix == 'linux-x64-gnu'
+        run: |
+          docker run --rm -v "$PWD/native:/src" -w /src -e CARGO_TARGET_DIR=/target ${{ matrix.rust }} sh -c \
+            "rustup component add rustfmt clippy && cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked"
+
+      - name: Local mode tests on this build
+        run: docker run --rm -v "$PWD/typescript:/app" -w /app ${{ matrix.node }} sh scripts/test-local.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.suffix }}
+          path: typescript/npm/${{ matrix.suffix }}/edgekv.${{ matrix.suffix }}.node
+          if-no-files-found: error
+
+  others:
+    name: Native, ${{ matrix.suffix }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { suffix: darwin-arm64, runner: macos-15, target: aarch64-apple-darwin, lib: libedgekv_native.dylib, test: true }
+          # Cross-compiled on Apple Silicon. There is no Intel runner here to run it on.
+          - { suffix: darwin-x64, runner: macos-15, target: x86_64-apple-darwin, lib: libedgekv_native.dylib, test: false }
+          - { suffix: win32-x64-msvc, runner: windows-latest, target: x86_64-pc-windows-msvc, lib: edgekv_native.dll, test: true }
+    defaults:
+      run:
+        shell: bash
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: |
+          cargo build --release --locked --manifest-path native/Cargo.toml --target ${{ matrix.target }}
+          cp "native/target/${{ matrix.target }}/release/${{ matrix.lib }}" \
+             "typescript/npm/${{ matrix.suffix }}/edgekv.${{ matrix.suffix }}.node"
+
+      - uses: actions/setup-node@v4
+        if: matrix.test
+        with:
+          node-version: "22"
+
+      - name: Local mode tests on this build
+        if: matrix.test
+        run: sh typescript/scripts/test-local.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.suffix }}
+          path: typescript/npm/${{ matrix.suffix }}/edgekv.${{ matrix.suffix }}.node
+          if-no-files-found: error
+
+  stage:
+    name: Stage on npm
+    needs: [check, linux, others]
+    if: github.event_name == 'workflow_dispatch' && inputs.stage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # npm provenance: each package records the run that built it
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      DIST_TAG: ${{ needs.check.outputs.dist_tag }}
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+
+      # `npm stage` arrived in npm 11.
+      - run: npm install -g npm@11 && npm --version
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: artifacts
+
+      - name: Put each library in its package
+        run: |
+          set -euo pipefail
+          for dir in typescript/npm/*/; do
+            suffix="$(basename "$dir")"
+            built="artifacts/native-$suffix/edgekv.$suffix.node"
+            if [ ! -f "$built" ]; then echo "::error::no build for $suffix"; exit 1; fi
+            cp "$built" "$dir"
+            cp LICENSE-MIT LICENSE-APACHE "$dir"
+          done
+          cp LICENSE-MIT LICENSE-APACHE typescript/
+
+      - name: Build @valkvlabs/edgekv
+        working-directory: typescript
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          npm test
+
+      # Platform packages first, so the summary lists them in the order to
+      # approve them: @valkvlabs/edgekv names them, and must not go public
+      # before they do.
+      - name: Stage every package
+        run: |
+          set -euo pipefail
+          summary="$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Staged @valkvlabs/edgekv $VERSION"
+            echo
+            echo "Nothing is public until approved. Approve with 2FA, platform packages first and \`@valkvlabs/edgekv\` last:"
+            echo
+            echo '```sh'
+            echo 'npm stage approve <stage-id> --otp <code>'
+            echo '```'
+          } >> "$summary"
+          for dir in typescript/npm/*/ typescript/; do
+            name="$(jq -r .name "$dir/package.json")"
+            echo "::group::$name@$VERSION"
+            if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+              echo "already published"
+            elif npm stage list "$name" 2>/dev/null | grep -qF "$VERSION"; then
+              echo "already staged"
+            else
+              (cd "$dir" && npm stage publish --access public --provenance --tag "$DIST_TAG")
+            fi
+            echo "::endgroup::"
+            {
+              echo
+              echo "### \`$name\`"
+              echo
+              echo '```'
+              npm stage list "$name" 2>&1 || true
+              echo '```'
+            } >> "$summary"
+          done

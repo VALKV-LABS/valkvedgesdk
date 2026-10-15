@@ -1,8 +1,13 @@
 {
-  "name": "@valkv/edgekv",
+  "name": "@valkvlabs/edgekv",
   "version": "0.1.0",
   "description": "Client for ValkvEdgeKV, the local-first key-value database",
   "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VALKV-LABS/valkvedgesdk.git",
+    "directory": "typescript"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -12,13 +17,30 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "README.md"],
-  "engines": { "node": ">=18" },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test 'test/unit.test.ts'",
-    "test:integration": "node --import tsx --test 'test/integration.test.ts'"
+    "test": "node --import tsx --test test/unit.test.ts",
+    "test:local": "node --import tsx --test test/local.test.ts",
+    "test:integration": "node --import tsx --test test/integration.test.ts",
+    "version:set": "node scripts/version.mjs set",
+    "version:check": "node scripts/version.mjs check"
+  },
+  "optionalDependencies": {
+    "@valkvlabs/edgekv-darwin-arm64": "0.1.0",
+    "@valkvlabs/edgekv-darwin-x64": "0.1.0",
+    "@valkvlabs/edgekv-linux-arm64-gnu": "0.1.0",
+    "@valkvlabs/edgekv-linux-arm64-musl": "0.1.0",
+    "@valkvlabs/edgekv-linux-x64-gnu": "0.1.0",
+    "@valkvlabs/edgekv-linux-x64-musl": "0.1.0",
+    "@valkvlabs/edgekv-win32-x64-msvc": "0.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.1",

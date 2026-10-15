@@ -201,3 +201,13 @@ test('mistakes in the options are caught before any request', async () => {
   await assert.rejects(kv.databases.create({ name: 'x1', region: 'us-west-2' }), /controlUrl/);
   assert.equal(seen.length, 0);
 });
+
+test('the local mode picks the native package for the platform', async () => {
+  const { platformSuffix } = await import('../src/native.js');
+  assert.equal(platformSuffix('linux', 'x64', false), 'linux-x64-gnu');
+  assert.equal(platformSuffix('linux', 'arm64', true), 'linux-arm64-musl');
+  assert.equal(platformSuffix('darwin', 'arm64', false), 'darwin-arm64');
+  assert.equal(platformSuffix('win32', 'x64', false), 'win32-x64-msvc');
+  assert.equal(platformSuffix('win32', 'arm64', false), null);
+  assert.equal(platformSuffix('freebsd', 'x64', false), null);
+});

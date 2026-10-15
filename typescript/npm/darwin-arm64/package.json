@@ -1,0 +1,24 @@
+{
+  "name": "@valkvlabs/edgekv-darwin-arm64",
+  "version": "0.1.0",
+  "description": "The darwin-arm64 build of the native library behind @valkvlabs/edgekv. Install @valkvlabs/edgekv, not this.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VALKV-LABS/valkvedgesdk.git",
+    "directory": "typescript/npm/darwin-arm64"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "edgekv.darwin-arm64.node",
+  "files": [
+    "edgekv.darwin-arm64.node"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

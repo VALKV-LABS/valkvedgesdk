@@ -1,0 +1,24 @@
+{
+  "name": "@valkvlabs/edgekv-win32-x64-msvc",
+  "version": "0.1.0",
+  "description": "The win32-x64-msvc build of the native library behind @valkvlabs/edgekv. Install @valkvlabs/edgekv, not this.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VALKV-LABS/valkvedgesdk.git",
+    "directory": "typescript/npm/win32-x64-msvc"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "edgekv.win32-x64-msvc.node",
+  "files": [
+    "edgekv.win32-x64-msvc.node"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

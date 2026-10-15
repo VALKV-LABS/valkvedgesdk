@@ -1,0 +1,119 @@
+name: npm release check
+
+# Run after the packages staged by the npm workflow have been approved.
+# Installs @valkvlabs/edgekv from npm the way a user would, on each kind of
+# machine, uses the local mode, and then creates the GitHub Release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example ts-v0.2.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: Install from npm (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64-gnu, runner: ubuntu-latest }
+          - { name: linux-arm64-gnu, runner: ubuntu-24.04-arm }
+          - { name: linux-x64-musl, runner: ubuntu-latest, alpine: true }
+          - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, alpine: true }
+          - { name: darwin-arm64, runner: macos-15 }
+          - { name: win32-x64-msvc, runner: windows-latest }
+    defaults:
+      run:
+        shell: bash
+    env:
+      INPUT_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Version from the tag
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG#refs/tags/}"
+          case "$tag" in
+            ts-v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::'$tag' is not a ts-vX.Y.Z tag"; exit 1 ;;
+          esac
+          echo "VERSION=${tag#ts-v}" >> "$GITHUB_ENV"
+
+      - name: A program that uses the local mode
+        run: |
+          mkdir -p "$RUNNER_TEMP/try"
+          cat > "$RUNNER_TEMP/try/try.sh" <<'EOF'
+          set -eu
+          cd "$(dirname "$0")"
+          npm init -y >/dev/null
+          # A version just approved can take a minute to reach every install.
+          for attempt in 1 2 3 4 5 6; do
+            npm install --no-audit --no-fund "@valkvlabs/edgekv@$VERSION" && break
+            [ "$attempt" = 6 ] && exit 1
+            sleep 20
+          done
+          echo "installed:"; ls node_modules/@valkvlabs
+          cat > try.mjs <<'JS'
+          import { LocalEdgeKV, EdgeKV } from '@valkvlabs/edgekv'
+          const kv = await LocalEdgeKV.open({ path: './kv' })
+          const db = await kv.database('smoke', { encryptionKey: new Uint8Array(32).fill(7) })
+          await db.put('hello', 'world')
+          if ((await db.getText('hello')) !== 'world') throw new Error('read back the wrong value')
+          await kv.close()
+          if (typeof EdgeKV !== 'function') throw new Error('EdgeKV is missing')
+          console.log(`local mode works on ${process.platform}-${process.arch}`)
+          JS
+          node try.mjs
+          EOF
+
+      - uses: actions/setup-node@v4
+        if: ${{ !matrix.alpine }}
+        with:
+          node-version: "22"
+
+      - name: Install and run
+        if: ${{ !matrix.alpine }}
+        run: sh "$RUNNER_TEMP/try/try.sh"
+
+      - name: Install and run on Alpine
+        if: ${{ matrix.alpine }}
+        run: docker run --rm -e VERSION -v "$RUNNER_TEMP/try:/try" node:22-alpine sh /try/try.sh
+
+  release:
+    name: GitHub Release
+    needs: install
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Version from the tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG#refs/tags/}"
+          version="${tag#ts-v}"
+          case "$version" in *-*) pre=true ;; *) pre=false ;; esac
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "prerelease=$pre"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "@valkvlabs/edgekv ${{ steps.tag.outputs.version }}"
+          prerelease: ${{ steps.tag.outputs.prerelease == 'true' }}
+          body: |
+            `npm install @valkvlabs/edgekv@${{ steps.tag.outputs.version }}`
+
+            Installs the client and the native library for the local mode on macOS (Apple Silicon and Intel),
+            Linux (x64 and arm64, glibc and musl) and Windows (x64).

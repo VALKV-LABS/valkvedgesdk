@@ -1,11 +1,13 @@
 /**
  * ValkvEdgeKV client for TypeScript and JavaScript.
  *
- * Talks to the service over HTTPS with an API key. It keeps no local copy:
- * every read and write is a request. (The Rust library is the one that keeps
- * a local replica and works offline.)
+ * `EdgeKV` talks to the service over HTTPS with an API key. It keeps no local
+ * copy: every read and write is a request. It needs a runtime with `fetch`:
+ * Node 18 or later, Deno, Bun, or a browser.
  *
- * Needs a runtime with `fetch`: Node 18 or later, Deno, Bun, or a browser.
+ * `LocalEdgeKV` keeps a copy on this machine, read without the network and
+ * written offline. It runs the valkvedge library, compiled for each platform
+ * and installed with this package. See `local.ts`.
  */
 
 /** A value to store: bytes, or text, which is stored as UTF-8. */
@@ -443,3 +445,7 @@ export class EdgeKV {
     return ((await response.json()) as { items: { region: string }[] }).items.map((item) => item.region);
   }
 }
+
+export { LocalEdgeKV, LocalDatabase } from './local.js';
+export type { Durability, LocalOptions, LocalDatabaseOptions, LocalWriteResult, LocalScanOptions, LocalStatus, WriteEvent } from './local.js';
+export { PLATFORMS } from './native.js';
