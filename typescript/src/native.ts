@@ -2,8 +2,8 @@
  * Finds and loads the native library behind the local mode.
  *
  * The library is compiled ahead of time for each platform and published as
- * its own package, `@valkv/edgekv-<platform>`. Each is an optional dependency
- * of `@valkv/edgekv` that declares its `os`, `cpu` and `libc`, so the package
+ * its own package, `@valkvlabs/edgekv-<platform>`. Each is an optional dependency
+ * of `@valkvlabs/edgekv` that declares its `os`, `cpu` and `libc`, so the package
  * manager installs only the one for the machine it runs on.
  *
  * Set `EDGEKV_NATIVE_PATH` to a built `.node` file to load that instead, for
@@ -86,14 +86,14 @@ async function load(): Promise<NativeBinding> {
       0,
     );
   }
-  const name = `@valkv/edgekv-${suffix}`;
+  const name = `@valkvlabs/edgekv-${suffix}`;
   try {
     return require(name) as NativeBinding;
   } catch (error) {
     throw new EdgeKVError(
       'UNSUPPORTED',
       `the local mode needs ${name}, which did not load (${error instanceof Error ? error.message : error}). ` +
-        'It is installed with @valkv/edgekv unless optional dependencies were left out: reinstall without --no-optional or --omit=optional',
+        'It is installed with @valkvlabs/edgekv unless optional dependencies were left out: reinstall without --no-optional or --omit=optional',
       0,
     );
   }

@@ -1,10 +1,10 @@
 name: npm
 
-# Builds the native library behind the local mode of @valkv/edgekv for every
-# platform, tests each build, and, when asked, publishes @valkv/edgekv and its
+# Builds the native library behind the local mode of @valkvlabs/edgekv for every
+# platform, tests each build, and, when asked, publishes @valkvlabs/edgekv and its
 # platform packages to npm.
 #
-# `npm install @valkv/edgekv` then installs the client and, as an optional
+# `npm install @valkvlabs/edgekv` then installs the client and, as an optional
 # dependency chosen by os, cpu and libc, the one native library for the
 # machine it runs on. Nobody installing it needs Rust.
 #
@@ -13,10 +13,10 @@ name: npm
 #   2. Run this workflow with the tag, for example ts-v0.2.0.
 #      With "publish" off it only builds and tests: use that to try a release.
 #      A version like 0.2.0-beta.1 is published under the dist-tag "next",
-#      so `npm install @valkv/edgekv` keeps getting the last release.
+#      so `npm install @valkvlabs/edgekv` keeps getting the last release.
 #
 # Publishing needs the secret NPM_TOKEN: an npm token that may publish to the
-# @valkv scope. Re-running a publish skips packages already on npm, so a run
+# @valkvlabs scope. Re-running a publish skips packages already on npm, so a run
 # that failed half-way can be run again.
 
 on:
@@ -214,15 +214,15 @@ jobs:
             fi
           done
 
-      - name: Publish @valkv/edgekv
+      - name: Publish @valkvlabs/edgekv
         working-directory: typescript
         run: |
           set -euo pipefail
           npm ci --no-audit --no-fund
           npm run build
           npm test
-          if npm view "@valkv/edgekv@$VERSION" version >/dev/null 2>&1; then
-            echo "@valkv/edgekv@$VERSION is already on npm"
+          if npm view "@valkvlabs/edgekv@$VERSION" version >/dev/null 2>&1; then
+            echo "@valkvlabs/edgekv@$VERSION is already on npm"
           else
             npm publish --access public --provenance --tag "$DIST_TAG"
           fi
@@ -234,13 +234,13 @@ jobs:
           npm init -y >/dev/null
           # A new version can take a minute to be visible to installs.
           for attempt in 1 2 3 4 5 6; do
-            npm install --no-audit --no-fund "@valkv/edgekv@$VERSION" && break
+            npm install --no-audit --no-fund "@valkvlabs/edgekv@$VERSION" && break
             [ "$attempt" = 6 ] && exit 1
             sleep 20
           done
-          ls node_modules/@valkv
+          ls node_modules/@valkvlabs
           cat > try.mjs <<'EOF'
-          import { LocalEdgeKV } from '@valkv/edgekv'
+          import { LocalEdgeKV } from '@valkvlabs/edgekv'
           const kv = await LocalEdgeKV.open({ path: './kv' })
           const db = await kv.database('smoke')
           await db.put('hello', 'world')
@@ -254,10 +254,10 @@ jobs:
         with:
           tag_name: ${{ needs.check.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: "@valkv/edgekv ${{ needs.check.outputs.version }}"
+          name: "@valkvlabs/edgekv ${{ needs.check.outputs.version }}"
           prerelease: ${{ needs.check.outputs.dist_tag == 'next' }}
           body: |
-            `npm install @valkv/edgekv@${{ needs.check.outputs.version }}`
+            `npm install @valkvlabs/edgekv@${{ needs.check.outputs.version }}`
 
             Installs the client and the native library for the local mode on macOS (Apple Silicon and Intel),
             Linux (x64 and arm64, glibc and musl) and Windows (x64).

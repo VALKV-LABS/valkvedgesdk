@@ -1,7 +1,7 @@
 {
-  "name": "@valkv/edgekv-linux-x64-gnu",
+  "name": "@valkvlabs/edgekv-linux-x64-gnu",
   "version": "0.1.0",
-  "description": "The linux-x64-gnu build of the native library behind @valkv/edgekv. Install @valkv/edgekv, not this.",
+  "description": "The linux-x64-gnu build of the native library behind @valkvlabs/edgekv. Install @valkvlabs/edgekv, not this.",
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",

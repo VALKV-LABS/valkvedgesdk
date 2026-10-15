@@ -10,7 +10,7 @@ tested. None is published yet.
 
 | Folder | What | State |
 |---|---|---|
-| [`typescript/`](typescript/README.md) | `@valkv/edgekv` for TypeScript and JavaScript: reads, writes, scans, waiting for changes, and managing databases; and a local mode with an offline copy on disk | Built; release workflow ready, not run |
+| [`typescript/`](typescript/README.md) | `@valkvlabs/edgekv` for TypeScript and JavaScript: reads, writes, scans, waiting for changes, and managing databases; and a local mode with an offline copy on disk | Built; release workflow ready, not run |
 | [`native/`](native/src/lib.rs) | The Rust bindings to the valkvedge library behind the local mode, built for each platform into `typescript/npm/` | Built and tested on Linux (glibc, musl) and Windows |
 | [`python/`](python/README.md) | `valkv-edgekv` for Python: the same, with the same names in Python style | Built |
 | [`desktop/`](desktop/README.md) | Desktop application (Tauri) for Windows and macOS: browse a database and its contents, create and delete databases | Built and tested on Windows; no release yet |
@@ -37,7 +37,7 @@ builds the native library for Linux and runs the TypeScript local mode on it.
 
 | What | Workflow | Where it goes |
 |---|---|---|
-| `@valkv/edgekv` and its platform packages | [`npm.yml`](.github/workflows/npm.yml), tag `ts-vX.Y.Z` | npm |
+| `@valkvlabs/edgekv` and its platform packages | [`npm.yml`](.github/workflows/npm.yml), tag `ts-vX.Y.Z` | npm |
 | Desktop application | [`desktop-release.yml`](.github/workflows/desktop-release.yml), tag `desktop-vX.Y.Z` | GitHub Releases |
 
 ## Licence
@@ -52,5 +52,5 @@ Everything here ships to customers, so treat it as public:
 - Describe the service only from the customer's side of its API: endpoints, request and
   response shapes, error codes, limits a client must respect.
 - Nothing about how the service is built or run.
-- Commits are authored by `Joti <joti@valkv.com>` only, with no co-author or tool
+- Commits are authored by `Joti <joti@valkvlabs.com>` only, with no co-author or tool
   attribution.

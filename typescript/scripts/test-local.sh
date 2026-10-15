@@ -6,13 +6,13 @@ set -eu
 cd "$(dirname "$0")/.."
 
 npm install --no-audit --no-fund --loglevel=error
-mkdir -p node_modules/@valkv
+mkdir -p node_modules/@valkvlabs
 found=0
 for dir in npm/*/; do
   suffix="$(basename "$dir")"
-  rm -rf "node_modules/@valkv/edgekv-$suffix"
+  rm -rf "node_modules/@valkvlabs/edgekv-$suffix"
   if [ -f "$dir/edgekv.$suffix.node" ]; then
-    cp -r "$dir" "node_modules/@valkv/edgekv-$suffix"
+    cp -r "$dir" "node_modules/@valkvlabs/edgekv-$suffix"
     found=1
   fi
 done

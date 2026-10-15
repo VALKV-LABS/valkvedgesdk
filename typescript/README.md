@@ -1,4 +1,4 @@
-# @valkv/edgekv for TypeScript and JavaScript
+# @valkvlabs/edgekv for TypeScript and JavaScript
 
 A client for ValkvEdgeKV, in two modes:
 
@@ -11,7 +11,7 @@ A client for ValkvEdgeKV, in two modes:
 | Runs on | Anywhere `fetch` exists: Node 18+, Deno, Bun, browsers | Node 18+, Bun, Deno on macOS, Linux and Windows (below) |
 
 ```sh
-npm install @valkv/edgekv
+npm install @valkvlabs/edgekv
 ```
 
 That one install has both. The local mode runs the valkvedge library, compiled ahead of
@@ -24,7 +24,7 @@ repository root type-checks, tests and builds it into `dist/`.
 ## Use, with no local copy
 
 ```ts
-import { EdgeKV } from '@valkv/edgekv'
+import { EdgeKV } from '@valkvlabs/edgekv'
 
 const kv = new EdgeKV({
   apiKey: process.env.EDGEKV_API_KEY!,   // ekv_…, from the portal
@@ -113,7 +113,7 @@ should carry an ordinary key, or one limited to a single database.
 ## Use, with a local copy
 
 ```ts
-import { LocalEdgeKV } from '@valkv/edgekv'
+import { LocalEdgeKV } from '@valkvlabs/edgekv'
 
 const kv = await LocalEdgeKV.open({
   path: './data/kv',                     // where the local copies live
@@ -177,11 +177,11 @@ The local mode is built for:
 | Linux, musl (Alpine) | ✓ | ✓ |
 | Windows | ✓ | |
 
-Each build is its own package, `@valkv/edgekv-<platform>`, which `@valkv/edgekv` lists as an
+Each build is its own package, `@valkvlabs/edgekv-<platform>`, which `@valkvlabs/edgekv` lists as an
 optional dependency. The package manager installs the one that matches the machine.
 Installing with `--no-optional` or `--omit=optional` leaves it out, and then
 `LocalEdgeKV.open` fails with `UNSUPPORTED`. `EdgeKV` works either way. A bundler must
-leave `@valkv/edgekv` external for the local mode to find its build.
+leave `@valkvlabs/edgekv` external for the local mode to find its build.
 
 Errors from the local mode are `EdgeKVError`s too, with `status` 0. Besides the codes
 below it can report `INVALID_ENCRYPTION_KEY`, `OUTBOX_FULL` (too many buffered writes
@@ -192,7 +192,7 @@ waiting to be pushed), `LOCAL_STORE` (the disk) and `UNSUPPORTED`.
 Every failure is an `EdgeKVError` with a stable `code`, the HTTP `status`, and a message.
 
 ```ts
-import { EdgeKVError } from '@valkv/edgekv'
+import { EdgeKVError } from '@valkvlabs/edgekv'
 
 try {
   await db.put('k', 'v')
@@ -271,10 +271,10 @@ EDGEKV_NATIVE_PATH=../native/target/release/libedgekv_native.dylib npm run test:
 ### Releasing
 
 The [npm workflow](../.github/workflows/npm.yml) builds the native library on every
-platform, tests each build, and publishes `@valkv/edgekv` with its seven platform
+platform, tests each build, and publishes `@valkvlabs/edgekv` with its seven platform
 packages, all at one version:
 
 1. `npm run version:set 0.2.0` here, and merge.
 2. Run the workflow with tag `ts-v0.2.0`: first with "publish" off to try it, then on.
 
-It needs the repository secret `NPM_TOKEN`, an npm token that may publish to `@valkv`.
+It needs the repository secret `NPM_TOKEN`, an npm token that may publish to `@valkvlabs`.

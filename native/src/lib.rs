@@ -1,6 +1,6 @@
 //! Node.js bindings to the valkvedge library.
 //!
-//! This is the native half of the local mode of `@valkv/edgekv`. It is
+//! This is the native half of the local mode of `@valkvlabs/edgekv`. It is
 //! deliberately thin: bytes in, bytes out. Text, JSON, async iteration and the
 //! error class live in the TypeScript package (`typescript/src/local.ts`).
 //!

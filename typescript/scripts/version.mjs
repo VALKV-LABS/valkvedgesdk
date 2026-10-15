@@ -1,4 +1,4 @@
-// Keeps the version of @valkv/edgekv, its platform packages and the native
+// Keeps the version of @valkvlabs/edgekv, its platform packages and the native
 // crate in step: they are published together and must match exactly.
 //
 //   node scripts/version.mjs set 0.2.0     write it everywhere
