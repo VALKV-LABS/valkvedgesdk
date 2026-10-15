@@ -35,6 +35,8 @@ builds the native library for Linux and runs the TypeScript local mode on it.
 
 ## Releases
 
+Step by step, including the one-time setup: [RELEASING.md](RELEASING.md).
+
 | What | Workflow | Where it goes |
 |---|---|---|
 | `@valkvlabs/edgekv` and its platform packages | [`npm.yml`](.github/workflows/npm.yml) stages them, a maintainer approves with 2FA, then [`npm-release-check.yml`](.github/workflows/npm-release-check.yml); tag `ts-vX.Y.Z` | npm |
