@@ -43,6 +43,30 @@ db.commit([
 
 All of them happen or none does.
 
+### Writing only if nothing changed
+
+Every value has a version that changes with each write. A write can require the key
+to still be at the version you read, so two clients updating the same counter or stock
+level never overwrite each other:
+
+```python
+current = db.get_versioned("stock/widget")      # Versioned(value, version), or None
+db.put("stock/widget", "8", if_version=current.version)
+db.put("order/1004", "{}", if_absent=True)      # create, never overwrite
+db.commit(operations, conditions=[{"key": "stock/widget", "version": current.version}])
+```
+
+If a condition does not hold, nothing is written and the call raises
+`CONDITION_FAILED` (`error.key` names the key). `update` does the read, the change and
+the retry for you:
+
+```python
+db.update("stock/widget", lambda value: str(int(value) - 1))
+```
+
+Your function gets the current value (`None` if there is none) and returns the new one
+(`None` deletes the key). It may run more than once, so keep it free of side effects.
+
 ### Reading many keys
 
 ```python
@@ -89,7 +113,37 @@ A database can be used on the data API a moment after it is created. Until then,
 requests for it fail with `NOT_FOUND`.
 
 Give such a key to tools you run yourself. An application you ship to other people
-should carry an ordinary key, or one limited to a single database.
+should not carry an API key at all: see the next section.
+
+## Apps on your users' devices
+
+Anyone can take an API key out of an app, so keep keys on your servers. Your backend,
+which knows who the user is, mints a short-lived token for that user's database:
+
+```python
+# On your backend, with the API key
+token = kv.database(f"notes-{user_id}").create_token(
+    scope="write",       # or "read", the default
+    ttl_seconds=3600,    # 60 to 86,400
+    subject=user_id,     # your own name for the user, kept in the token
+)
+# token.token, token.expires_at
+```
+
+A Python app on a user's device gets tokens from your backend instead of holding a key:
+
+```python
+def tokens(database):
+    return requests.get("https://my-backend.example.com/edgekv-token", params={"db": database}).text
+
+kv = EdgeKV(url="https://api.example.com", tokens=tokens)
+kv.database(f"notes-{user_id}").put("note/1", "hello")
+```
+
+The client asks for a token the first time it uses a database, again about a minute
+before the token expires, and whenever the service refuses it (`TOKEN_EXPIRED`), and
+then repeats the request once. A token works for its one database only, cannot mint
+tokens or manage databases, and stops working when the key that minted it is revoked.
 
 ## Errors
 
@@ -110,8 +164,10 @@ except EdgeKVError as error:
 
 | Code | What it means |
 |---|---|
-| `UNAUTHENTICATED` | The API key is missing, wrong or revoked |
-| `FORBIDDEN` | The key may not do this: a read-only key writing, or an ordinary key managing databases |
+| `UNAUTHENTICATED` | The API key or token is missing, wrong or revoked |
+| `TOKEN_EXPIRED` | The token has expired. With `tokens`, the client gets a new one and tries again |
+| `FORBIDDEN` | The key may not do this: a read-only key or token writing, an ordinary key managing databases, a token minting tokens |
+| `CONDITION_FAILED` | A conditional write found the key changed; nothing was written. `error.key` names the key |
 | `NOT_FOUND` | No such database for this key |
 | `ACCOUNT_SUSPENDED` | The account cannot be used at the moment |
 | `STORAGE_QUOTA_EXCEEDED` | The account is over its storage limit; reads and deletes still work |
@@ -134,7 +190,8 @@ once.
 
 A request that gets no answer within 15 seconds fails with `TIMEOUT` and is not retried
 for you, because the service may have carried it out. Repeating it yourself is safe for
-the same reason.
+the same reason, except for a conditional write: if the first attempt was stored, the
+repeat raises `CONDITION_FAILED`, so read the key to find out.
 
 ```python
 EdgeKV(api_key, url, retries=0, timeout=5.0)

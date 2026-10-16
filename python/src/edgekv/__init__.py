@@ -1,8 +1,8 @@
 """ValkvEdgeKV client for Python.
 
-Talks to the service over HTTPS with an API key. It keeps no local copy: every
-read and write is a request. (The Rust library is the one that keeps a local
-replica and works offline.)
+Talks to the service over HTTPS with an API key, or with access tokens your
+backend mints. It keeps no local copy: every read and write is a request. (The
+Rust library is the one that keeps a local replica and works offline.)
 
 Uses only the standard library. Python 3.9 or later.
 """
@@ -13,6 +13,7 @@ import base64
 import json
 import random
 import socket
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -30,7 +31,10 @@ __all__ = [
     "DatabaseInfo",
     "UsageHour",
     "Page",
+    "Token",
+    "Versioned",
     "RETRYABLE",
+    "UPDATE_ATTEMPTS",
 ]
 __version__ = "0.1.0"
 
@@ -48,11 +52,24 @@ RETRYABLE = ("RATE_LIMITED", "LEASE_HELD", "UNAVAILABLE")
 #: answer came in time and ``OSError`` when the service could not be reached.
 Transport = Callable[[str, str, Dict[str, str], Optional[bytes], float], Tuple[int, Mapping[str, str], bytes]]
 
+#: Gets an access token for one database, usually by asking your backend, which
+#: mints it with :meth:`Database.create_token`. Called with the database's name
+#: the first time it is used, again about a minute before the token expires,
+#: and whenever the service refuses it.
+TokenSource = Callable[[str], str]
+
+#: How many times :meth:`Database.update` reads and tries again before giving
+#: up with ``CONDITION_FAILED``.
+UPDATE_ATTEMPTS = 16
+
+#: Codes that mean the credential itself was refused.
+_REFUSED = ("TOKEN_EXPIRED", "UNAUTHENTICATED")
+
 
 class EdgeKVError(Exception):
     """Any failure reported by the service, or in reaching it."""
 
-    def __init__(self, code: str, message: str, status: int) -> None:
+    def __init__(self, code: str, message: str, status: int, key: Optional[bytes] = None) -> None:
         super().__init__(f"{code}: {message}")
         #: A stable code, for example ``NOT_FOUND`` or ``STORAGE_QUOTA_EXCEEDED``.
         #: ``NETWORK`` and ``TIMEOUT`` are raised by this client.
@@ -60,6 +77,8 @@ class EdgeKVError(Exception):
         self.message = message
         #: The HTTP status, or 0 when no response arrived.
         self.status = status
+        #: For ``CONDITION_FAILED``: the key whose condition did not hold, when known.
+        self.key = key
 
     @property
     def retryable(self) -> bool:
@@ -73,6 +92,28 @@ class Entry:
     #: The key as stored, for keys that are not valid UTF-8 text.
     key_bytes: bytes
     value: bytes
+    #: The value's version, when the service reports it.
+    version: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class Versioned:
+    """A value and its version: pass the version back to write only if the
+    value has not changed since."""
+
+    value: bytes
+    version: str
+
+
+@dataclass(frozen=True)
+class Token:
+    """An access token for one database."""
+
+    #: Send it as a key: ``Authorization: Bearer <token>``, or hand it to an app.
+    token: str
+    #: ``read`` or ``write``.
+    scope: str
+    expires_at: str
 
 
 @dataclass(frozen=True)
@@ -124,6 +165,14 @@ def _b64(value: Value) -> str:
     return base64.b64encode(_to_bytes(value)).decode("ascii")
 
 
+def _condition_headers(if_version: Optional[str], if_absent: bool) -> Dict[str, str]:
+    if if_version is not None and if_absent:
+        raise EdgeKVError("BAD_REQUEST", "give if_version or if_absent, not both", 0)
+    if if_version is not None:
+        return {"If-Match": if_version}
+    return {"If-None-Match": "*"} if if_absent else {}
+
+
 def _key_path(key: str) -> str:
     """A key as a URL path: every segment escaped, slashes kept."""
     if not isinstance(key, str):
@@ -149,18 +198,87 @@ def _urllib_transport(
         raise OSError(str(error.reason)) from error
 
 
-class _Client:
-    """Sends requests to one base URL: adds the key, the timeout and the retries,
-    and turns failures into :class:`EdgeKVError`."""
+def _refresh_at(token: str, now: Optional[float] = None) -> float:
+    """When to stop using a token, in seconds since the epoch: a minute before
+    its ``exp``, or halfway through its life if that is sooner. A token that
+    does not say is used until refused."""
+    now = time.time() if now is None else now
+    try:
+        part = token.split(".")[1]
+        exp = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("exp")
+    except (IndexError, ValueError, AttributeError):
+        return float("inf")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool):
+        return float("inf")
+    return max(exp - 60.0, now + (exp - now) / 2)
 
-    def __init__(self, base: str, api_key: str, timeout: float, retries: int, transport: Transport) -> None:
-        self._base = base.rstrip("/")
+
+class _ApiKey:
+    """A fixed API key."""
+
+    def __init__(self, api_key: str) -> None:
         self._api_key = api_key
+
+    def get(self) -> str:
+        return self._api_key
+
+    def refuse(self, token: str) -> bool:
+        return False
+
+
+class _TokenCache:
+    """One database's access token, fetched from the application's source and
+    kept until it is due for renewal. Safe to share between threads."""
+
+    def __init__(self, source: TokenSource, database: str) -> None:
+        self._source = source
+        self._database = database
+        self._lock = threading.Lock()
+        self._token: Optional[str] = None
+        self._refresh_at = 0.0
+
+    def get(self) -> str:
+        with self._lock:
+            if self._token is not None and time.time() < self._refresh_at:
+                return self._token
+            try:
+                token = self._source(self._database)
+            except EdgeKVError:
+                raise
+            except Exception as error:
+                # Retryable, like a service that is briefly unavailable.
+                raise EdgeKVError("UNAVAILABLE", f"the token source failed: {error}", 0) from error
+            if not isinstance(token, str) or not token:
+                raise EdgeKVError("BAD_REQUEST", f"the token source returned no token for {self._database}", 0)
+            self._token, self._refresh_at = token, _refresh_at(token)
+            return token
+
+    def refuse(self, token: str) -> bool:
+        with self._lock:
+            if self._token == token:
+                self._token = None
+        return True
+
+
+class _Client:
+    """Sends requests to one base URL: adds the credential, the timeout and the
+    retries, and turns failures into :class:`EdgeKVError`."""
+
+    def __init__(self, base: str, credential: Any, timeout: float, retries: int, transport: Transport) -> None:
+        self._base = base.rstrip("/")
+        self._credential = credential
         self._timeout = timeout
         self._retries = retries
         self._transport = transport
 
-    def send(
+    def with_credential(self, credential: Any) -> "_Client":
+        """The same service, with another credential."""
+        return _Client(self._base, credential, self._timeout, self._retries, self._transport)
+
+    def send(self, method: str, path: str, **options: Any) -> bytes:
+        return self.request(method, path, **options)[1]
+
+    def request(
         self,
         method: str,
         path: str,
@@ -168,30 +286,42 @@ class _Client:
         body: Optional[bytes] = None,
         json_body: Any = None,
         query: Optional[Mapping[str, Any]] = None,
+        headers: Optional[Mapping[str, str]] = None,
         timeout: Optional[float] = None,
-    ) -> bytes:
+    ) -> Tuple[Mapping[str, str], bytes]:
+        """Sends a request and returns the answer's headers (lowercase names) and body."""
         url = self._base + path
         pairs = [(name, str(value)) for name, value in (query or {}).items() if value is not None]
         if pairs:
             url += "?" + urllib.parse.urlencode(pairs)
-        headers = {"Authorization": f"Bearer {self._api_key}"}
+        base_headers = dict(headers or {})
         if json_body is not None:
-            headers["Content-Type"] = "application/json"
+            base_headers["Content-Type"] = "application/json"
             body = json.dumps(json_body).encode("utf-8")
         elif body is not None:
-            headers["Content-Type"] = "application/octet-stream"
+            base_headers["Content-Type"] = "application/octet-stream"
         attempt = 0
+        renewed = False
         while True:
+            token: Optional[str] = None
             try:
-                return self._once(method, url, headers, body, self._timeout if timeout is None else timeout)
+                token = self._credential.get()
+                sent = dict(base_headers, Authorization=f"Bearer {token}")
+                return self._once(method, url, sent, body, self._timeout if timeout is None else timeout)
             except EdgeKVError as error:
+                # A refused token is renewed and the request tried once more, at once.
+                if error.code in _REFUSED and token is not None and not renewed and self._credential.refuse(token):
+                    renewed = True
+                    continue
                 if not error.retryable or attempt >= self._retries:
                     raise
                 # 0.1 s, 0.2 s, 0.4 s, …, with jitter so many clients do not retry together.
                 time.sleep(0.1 * 2**attempt * (0.5 + random.random()))
                 attempt += 1
 
-    def _once(self, method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: float) -> bytes:
+    def _once(
+        self, method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: float
+    ) -> Tuple[Mapping[str, str], bytes]:
         try:
             status, reply_headers, payload = self._transport(method, url, headers, body, timeout)
         except (TimeoutError, socket.timeout) as error:
@@ -203,18 +333,21 @@ class _Client:
             origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(url))
             raise EdgeKVError("NETWORK", f"could not reach {origin}: {error}", 0) from error
         if 200 <= status < 300:
-            return payload
+            return reply_headers, payload
         code = reply_headers.get("x-edgekv-error", "")
         message = ""
+        key: Optional[bytes] = None
         try:
             parsed = json.loads(payload)
             detail = parsed.get("error", {}) if isinstance(parsed, dict) else {}
             if isinstance(detail, dict):
                 code = detail.get("code") or code
                 message = detail.get("message") or ""
+                if isinstance(detail.get("key"), str):
+                    key = base64.b64decode(detail["key"])
         except ValueError:
             pass  # Not the service's error shape: a gateway or proxy answered.
-        raise EdgeKVError(code or "SERVICE_ERROR", message or f"the service answered {status}", status)
+        raise EdgeKVError(code or "SERVICE_ERROR", message or f"the service answered {status}", status, key)
 
     def send_json(self, method: str, path: str, **options: Any) -> Any:
         return json.loads(self.send(method, path, **options))
@@ -233,12 +366,18 @@ class Database:
 
     def get(self, key: str) -> Optional[bytes]:
         """The value stored under ``key``, or ``None`` if there is none."""
+        found = self.get_versioned(key)
+        return None if found is None else found.value
+
+    def get_versioned(self, key: str) -> Optional[Versioned]:
+        """The value stored under ``key`` and its version, or ``None`` if there is none."""
         try:
-            return self._client.send("GET", self._path(f"/kv/{_key_path(key)}"))
+            headers, value = self._client.request("GET", self._path(f"/kv/{_key_path(key)}"))
         except EdgeKVError as error:
             if error.code == "KEY_NOT_FOUND":
                 return None
             raise
+        return Versioned(value, headers.get("x-edgekv-version", ""))
 
     def get_text(self, key: str) -> Optional[str]:
         """The value as text, or ``None``."""
@@ -250,25 +389,92 @@ class Database:
         text = self.get_text(key)
         return None if text is None else json.loads(text)
 
-    def put(self, key: str, value: Value) -> int:
+    def put(self, key: str, value: Value, *, if_version: Optional[str] = None, if_absent: bool = False) -> int:
         """Stores a value and returns its position in the log. Returns once the
-        service has made it durable."""
-        return int(self._client.send_json("PUT", self._path(f"/kv/{_key_path(key)}"), body=_to_bytes(value))["lsn"])
+        service has made it durable.
 
-    def put_json(self, key: str, value: Any) -> int:
+        With ``if_version``, only if the key is still at that version; with
+        ``if_absent``, only if it has no value. Otherwise nothing is written and
+        it raises ``CONDITION_FAILED``.
+        """
+        reply = self._client.send_json(
+            "PUT",
+            self._path(f"/kv/{_key_path(key)}"),
+            body=_to_bytes(value),
+            headers=_condition_headers(if_version, if_absent),
+        )
+        return int(reply["lsn"])
+
+    def put_json(self, key: str, value: Any, *, if_version: Optional[str] = None, if_absent: bool = False) -> int:
         """Stores a value as JSON text."""
-        return self.put(key, json.dumps(value))
+        return self.put(key, json.dumps(value), if_version=if_version, if_absent=if_absent)
 
-    def delete(self, key: str) -> int:
-        """Removes a key. Removing a key that is not there is not an error."""
-        return int(self._client.send_json("DELETE", self._path(f"/kv/{_key_path(key)}"))["lsn"])
+    def delete(self, key: str, *, if_version: Optional[str] = None) -> int:
+        """Removes a key. Removing a key that is not there is not an error,
+        unless ``if_version`` is given."""
+        reply = self._client.send_json(
+            "DELETE", self._path(f"/kv/{_key_path(key)}"), headers=_condition_headers(if_version, False)
+        )
+        return int(reply["lsn"])
 
-    def commit(self, operations: Sequence[Mapping[str, Any]]) -> int:
+    def update(self, key: str, change: Callable[[Optional[bytes]], Optional[Value]]) -> Optional[int]:
+        """Reads a key, computes its new value with ``change``, and writes it
+        back if nobody else wrote the key in between, reading and trying again
+        if they did. Use it for counters, stock levels and anything else a plain
+        put would lose updates to.
+
+        ``change`` gets the current value (``None`` when there is none) and
+        returns the new one (``None`` deletes the key); it may run more than
+        once. Returns the write's position in the log, or ``None`` when nothing
+        was written (there was no value and ``change`` returned ``None``).
+        """
+        for _ in range(UPDATE_ATTEMPTS):
+            current = self.get_versioned(key)
+            new = change(None if current is None else current.value)
+            try:
+                if new is not None:
+                    if current is None:
+                        return self.put(key, new, if_absent=True)
+                    return self.put(key, new, if_version=current.version)
+                if current is None:
+                    return None
+                return self.delete(key, if_version=current.version)
+            except EdgeKVError as error:
+                if error.code != "CONDITION_FAILED":
+                    raise
+        raise EdgeKVError(
+            "CONDITION_FAILED", f"{key} kept changing: gave up after {UPDATE_ATTEMPTS} attempts", 412, _to_bytes(key)
+        )
+
+    def create_token(
+        self, scope: Optional[str] = None, ttl_seconds: Optional[int] = None, subject: Optional[str] = None
+    ) -> Token:
+        """Mints an access token for this database, to give to an app on a
+        user's device instead of an API key. Call it on your backend, with an
+        API key.
+
+        :param scope: ``read`` (the default) or ``write``. A read-only key can
+            mint only read tokens.
+        :param ttl_seconds: how long the token works, 60 to 86,400. Default 3600.
+        :param subject: your own name for the user, kept in the token.
+        """
+        body = {name: value for name, value in (("scope", scope), ("ttl_seconds", ttl_seconds), ("subject", subject)) if value is not None}
+        reply = self._client.send_json("POST", self._path("/tokens"), json_body=body)
+        return Token(reply["token"], reply["scope"], reply["expires_at"])
+
+    def commit(
+        self, operations: Sequence[Mapping[str, Any]], *, conditions: Optional[Sequence[Mapping[str, Any]]] = None
+    ) -> int:
         """Several puts and deletes as one write: all of them happen or none does.
 
         Each operation is ``{"op": "put", "key": …, "value": …}`` or
         ``{"op": "delete", "key": …}``. Keys here may be bytes, so this also
         reaches keys that are not text.
+
+        Each condition is ``{"key": …, "version": …}``: the key must still be at
+        that version, or have no value when the version is ``None``. If one does
+        not hold, nothing is written and it raises ``CONDITION_FAILED`` with the
+        key in ``error.key``.
         """
         if not operations:
             raise EdgeKVError("BAD_REQUEST", "a commit needs at least one operation", 0)
@@ -281,7 +487,10 @@ class Database:
                 ops.append({"op": "delete", "key": _b64(operation["key"])})
             else:
                 raise EdgeKVError("BAD_REQUEST", f'an operation is "put" or "delete", not {kind!r}', 0)
-        return int(self._client.send_json("POST", self._path("/commit"), json_body={"ops": ops})["lsn"])
+        payload: Dict[str, Any] = {"ops": ops}
+        if conditions:
+            payload["conditions"] = [{"key": _b64(c["key"]), "version": c["version"]} for c in conditions]
+        return int(self._client.send_json("POST", self._path("/commit"), json_body=payload)["lsn"])
 
     def scan_page(
         self, prefix: Optional[str] = None, page_size: Optional[int] = None, page_token: Optional[str] = None
@@ -293,7 +502,8 @@ class Database:
         items = []
         for item in page["items"]:
             key_bytes = base64.b64decode(item["key"])
-            items.append(Entry(key_bytes.decode("utf-8", "replace"), key_bytes, base64.b64decode(item["value"])))
+            value = base64.b64decode(item["value"])
+            items.append(Entry(key_bytes.decode("utf-8", "replace"), key_bytes, value, item.get("version")))
         return Page(items, page.get("next_page_token"))
 
     def scan(self, prefix: Optional[str] = None, page_size: Optional[int] = None) -> Iterator[Entry]:
@@ -399,7 +609,8 @@ class Databases:
 class EdgeKV:
     """The client. Create one and keep it: it holds no connection and is cheap.
 
-    :param api_key: an API key from the portal: ``ekv_…``.
+    :param api_key: an API key from the portal: ``ekv_…``. For your servers.
+        Give this or ``tokens``.
     :param url: where the data API is, for example ``https://api.example.com``.
     :param control_url: where databases are managed, for example
         ``https://cp.example.com``. Only needed for :attr:`databases` and
@@ -410,30 +621,51 @@ class EdgeKV:
         says it was not done and can be repeated (see :data:`RETRYABLE`). 0
         turns retries off.
     :param transport: sends the requests, instead of ``urllib``.
+    :param tokens: for apps on your users' devices, which must not hold an API
+        key: a function that returns an access token for a database name (see
+        :data:`TokenSource`). Give this or ``api_key``.
     """
 
     def __init__(
         self,
-        api_key: str,
-        url: str,
+        api_key: Optional[str] = None,
+        url: Optional[str] = None,
         control_url: Optional[str] = None,
         *,
+        tokens: Optional[TokenSource] = None,
         timeout: float = 15.0,
         retries: int = 3,
         transport: Optional[Transport] = None,
     ) -> None:
-        if not isinstance(api_key, str) or not api_key.startswith("ekv_"):
+        if (api_key is None) == (tokens is None):
+            raise EdgeKVError(
+                "BAD_REQUEST", "give api_key (on a server) or tokens (in an app), not both and not neither", 0
+            )
+        if api_key is not None and (not isinstance(api_key, str) or not api_key.startswith("ekv_")):
             raise EdgeKVError("BAD_REQUEST", "api_key must be an API key from the portal: ekv_…", 0)
+        if tokens is not None and not callable(tokens):
+            raise EdgeKVError("BAD_REQUEST", "tokens must be a function that returns a token for a database name", 0)
         if not url:
             raise EdgeKVError("BAD_REQUEST", "url is required: where the data API is", 0)
         send = transport or _urllib_transport
-        self._data = _Client(url, api_key, timeout, retries, send)
-        self._control = _Client(control_url, api_key, timeout, retries, send) if control_url else None
+        credential = _ApiKey(api_key or "")
+        self._tokens = tokens
+        #: Each database's token, shared by every Database for it.
+        self._caches: Dict[str, _TokenCache] = {}
+        self._caches_lock = threading.Lock()
+        self._data = _Client(url, credential, timeout, retries, send)
+        self._control = (
+            _Client(control_url, credential, timeout, retries, send) if control_url and api_key is not None else None
+        )
         #: Creating, listing and deleting databases. Needs ``control_url`` and a
         #: key that may manage databases.
         self.databases = Databases(self._require_control)
 
     def _require_control(self) -> _Client:
+        if self._tokens is not None:
+            raise EdgeKVError(
+                "BAD_REQUEST", "managing databases needs an API key; an access token works for one database only", 0
+            )
         if self._control is None:
             raise EdgeKVError("BAD_REQUEST", "managing databases needs control_url", 0)
         return self._control
@@ -441,7 +673,13 @@ class EdgeKV:
     def database(self, name: str) -> Database:
         """A database by name. Makes no request: a wrong name shows up as
         ``NOT_FOUND`` on first use."""
-        return Database(self._data, name)
+        if self._tokens is None:
+            return Database(self._data, name)
+        with self._caches_lock:
+            cache = self._caches.get(name)
+            if cache is None:
+                cache = self._caches[name] = _TokenCache(self._tokens, name)
+        return Database(self._data.with_credential(cache), name)
 
     def regions(self) -> List[str]:
         """Regions a database can be created in."""

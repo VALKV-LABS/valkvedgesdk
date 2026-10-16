@@ -145,6 +145,54 @@ test('waitForChange returns when another writer writes, and on its timeout other
   assert.equal(woke.lsn, written.lsn);
 });
 
+test('a write with a stale version is refused, and update loses no increments', async () => {
+  const written = await db.put('cas/stock', '10');
+  const read = await db.getVersioned('cas/stock');
+  assert.equal(text(read!.value), '10');
+  assert.equal(read!.version, written.version);
+
+  await db.put('cas/stock', '9', { ifVersion: read!.version });
+  await assert.rejects(db.put('cas/stock', '8', { ifVersion: read!.version }), (error: EdgeKVError) => {
+    assert.equal(error.code, 'CONDITION_FAILED');
+    assert.equal(error.status, 412);
+    assert.equal(text(error.key ?? null), 'cas/stock');
+    return true;
+  });
+  await assert.rejects(db.put('cas/stock', 'x', { ifAbsent: true }), { code: 'CONDITION_FAILED' });
+  assert.equal(await db.getText('cas/stock'), '9');
+
+  const result = await db.commit([{ op: 'put', key: 'cas/new', value: '1' }], { conditions: [{ key: 'cas/new', version: null }] });
+  assert.equal(result.versions.length, 1);
+
+  const increment = (current: Uint8Array | null) => String(Number(text(current) ?? '0') + 1);
+  await Promise.all(Array.from({ length: 5 }, () => db.update('cas/counter', increment)));
+  assert.equal(await db.getText('cas/counter'), '5');
+});
+
+test('an app with tokens from the backend reads and writes one database, and no more', async () => {
+  // The backend: holds the API key and mints a token per database.
+  const minted: string[] = [];
+  const app = new EdgeKV({
+    url: env('EDGEKV_URL'),
+    tokens: async (database) => {
+      minted.push(database);
+      return (await kv.database(database).createToken({ scope: 'write', ttlSeconds: 300, subject: 'sdk-test' })).token;
+    },
+  });
+  await app.database(name).put('token/a', 'from the app');
+  assert.equal(await app.database(name).getText('token/a'), 'from the app');
+  assert.deepEqual(minted, [name]);
+
+  const read = await kv.database(name).createToken();
+  assert.equal(read.scope, 'read');
+  assert.ok(Date.parse(read.expiresAt) > Date.now());
+  const reader = new EdgeKV({ url: env('EDGEKV_URL'), tokens: () => read.token });
+  assert.equal(await reader.database(name).getText('token/a'), 'from the app');
+  await assert.rejects(reader.database(name).put('token/a', 'no'), { code: 'FORBIDDEN', status: 403 });
+  // A token cannot mint more tokens.
+  await assert.rejects(reader.database(name).createToken(), { status: 403 });
+});
+
 test('a database that does not exist, and a key that is wrong, are told apart', async () => {
   await assert.rejects(kv.database('no-such-database').get('k'), { code: 'NOT_FOUND', status: 404 });
   const stranger = new EdgeKV({ apiKey: 'ekv_this-key-was-never-issued-000000', url: env('EDGEKV_URL'), controlUrl: env('EDGEKV_CONTROL_URL') });

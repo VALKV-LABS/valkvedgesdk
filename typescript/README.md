@@ -56,6 +56,30 @@ await db.commit([
 
 All of them happen or none does.
 
+### Writing only if nothing changed
+
+Every value has a version that changes with each write. A write can require the key
+to still be at the version you read, so two clients updating the same counter or stock
+level never overwrite each other:
+
+```ts
+const current = await db.getVersioned('stock/widget')    // { value, version } or null
+await db.put('stock/widget', '8', { ifVersion: current!.version })
+await db.put('order/1004', '{}', { ifAbsent: true })      // create, never overwrite
+await db.commit(operations, { conditions: [{ key: 'stock/widget', version: current!.version }] })
+```
+
+If a condition does not hold, nothing is written and the call fails with
+`CONDITION_FAILED` (`error.key` names the key). `update` does the read, the change and
+the retry for you:
+
+```ts
+await db.update('stock/widget', (value) => String(Number(new TextDecoder().decode(value!)) - 1))
+```
+
+Your function gets the current value (`null` if there is none) and returns the new one
+(`null` deletes the key). It may run more than once, so keep it free of side effects.
+
 ### Reading many keys
 
 ```ts
@@ -108,7 +132,38 @@ A database can be used on the data API a moment after it is created. Until then,
 requests for it fail with `NOT_FOUND`.
 
 Give such a key to tools you run yourself. An application you ship to other people
-should carry an ordinary key, or one limited to a single database.
+should not carry an API key at all: see the next section.
+
+## Apps on your users' devices
+
+Anyone can take an API key out of an app, so keep keys on your servers. Your backend,
+which knows who the user is, mints a short-lived token for that user's database:
+
+```ts
+// On your backend, with the API key
+const { token, expiresAt } = await kv.database(`notes-${userId}`).createToken({
+  scope: 'write',          // or 'read', the default
+  ttlSeconds: 3600,        // 60 to 86 400
+  subject: userId,         // your own name for the user, kept in the token
+})
+```
+
+The app gets tokens from your backend instead of holding a key:
+
+```ts
+// In the app
+const kv = new EdgeKV({
+  url: 'https://api.example.com',
+  tokens: async (database) => (await fetch(`/my-backend/edgekv-token?db=${database}`)).text(),
+})
+await kv.database(`notes-${userId}`).put('note/1', 'hello')
+```
+
+The client asks for a token the first time it uses a database, again about a minute
+before the token expires, and whenever the service refuses it (`TOKEN_EXPIRED`), and
+then repeats the request once. A token works for its one database only, cannot mint
+tokens or manage databases, and stops working when the key that minted it is revoked.
+`LocalEdgeKV.open` takes `tokens` in the same way.
 
 ## Use, with a local copy
 
@@ -132,8 +187,10 @@ await kv.close()                         // before the process exits
 ```
 
 The methods are the ones `EdgeKV` has, with the same names: `get`, `getText`, `getJson`,
-`put`, `putJson`, `delete`, `commit`, `scan`, `scanPage`. Writes also take
-`{ durability }`.
+`getVersioned`, `put`, `putJson`, `delete`, `commit`, `update`, `scan`, `scanPage`.
+Writes also take `{ durability }`. Conditions (`ifVersion`, `ifAbsent`, `conditions`,
+`update`) need a sync write when the database follows the service; on a buffered write
+they fail with `UNSUPPORTED`.
 
 Leave out `url` and `apiKey` for databases that live only on this machine. Names can
 then also be `namespace/name`, to keep one user's or one tenant's databases together.
@@ -153,6 +210,22 @@ Set the default for a database with `kv.database(name, { durability: 'buffered' 
 What other devices write reaches the local copy in the background, about once a second.
 `db.sync()` pushes and pulls now; `db.status()` shows how many buffered writes are still
 waiting.
+
+### Following changes
+
+```ts
+const watch = db.watch('order/')         // every key when left out
+for await (const change of watch) {
+  if (change.type === 'reset') reloadEverything()
+  else show(change.key, change.value)    // value is null when the key was deleted
+}
+```
+
+A watch reports each change as it reaches the local copy: this process's writes, writes
+pulled from the service, and buffered writes that lost to a newer one. `reset` means any
+key may have changed, for example after the copy was reloaded from the service: read
+again whatever you show. Leaving the loop closes the watch; so does `watch.close()`. An
+open watch keeps the process running.
 
 ### Encryption
 
@@ -205,8 +278,10 @@ try {
 
 | Code | What it means |
 |---|---|
-| `UNAUTHENTICATED` | The API key is missing, wrong or revoked |
-| `FORBIDDEN` | The key may not do this: a read-only key writing, or an ordinary key managing databases |
+| `UNAUTHENTICATED` | The API key or token is missing, wrong or revoked |
+| `TOKEN_EXPIRED` | The token has expired. With `tokens`, the client gets a new one and tries again |
+| `FORBIDDEN` | The key may not do this: a read-only key or token writing, an ordinary key managing databases, a token minting tokens |
+| `CONDITION_FAILED` | A conditional write found the key changed; nothing was written. `error.key` names the key |
 | `NOT_FOUND` | No such database for this key |
 | `ACCOUNT_SUSPENDED` | The account cannot be used at the moment |
 | `STORAGE_QUOTA_EXCEEDED` | The account is over its storage limit; reads and deletes still work |
@@ -229,7 +304,8 @@ once.
 
 A request that gets no answer within 15 seconds fails with `TIMEOUT` and is not retried
 for you, because the service may have carried it out. Repeating it yourself is safe for
-the same reason.
+the same reason, except for a conditional write: if the first attempt was stored, the
+repeat fails with `CONDITION_FAILED`, so read the key to find out.
 
 ```ts
 new EdgeKV({ apiKey, url, retries: 0, timeoutMs: 5_000 })
