@@ -214,8 +214,10 @@ jobs:
 
       - name: Build @valkvlabs/edgekv
         working-directory: typescript
+        # Not `npm ci`: the lock file cannot list the platform packages before
+        # they are public on npm, and npm 11 refuses `npm ci` without them.
         run: |
-          npm ci --no-audit --no-fund
+          npm install --no-audit --no-fund
           npm run build
           npm test
 
