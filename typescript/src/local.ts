@@ -48,7 +48,7 @@ export interface LocalOptions {
 }
 
 export interface LocalDatabaseOptions {
-  /** Used by writes that do not name one. Default `'sync'`. */
+  /** Used by writes that do not name one. Default `'sync'`, or `'buffered'` when ingesting. */
   durability?: Durability;
   /**
    * 32 bytes. Values are encrypted with it on this machine, before they are
@@ -56,6 +56,13 @@ export interface LocalDatabaseOptions {
    * Keys (the names) are not encrypted. A lost key cannot be recovered.
    */
   encryptionKey?: Uint8Array;
+  /**
+   * Keep no copy of the database here: writes are buffered on disk,
+   * uploaded in the background and removed once the service has them, and
+   * reads (`get`, `scan`) go to the service. For devices that mostly write,
+   * such as sensors. Needs `url`. `watch` is not available.
+   */
+  ingest?: boolean;
 }
 
 export interface LocalWriteResult {
@@ -184,14 +191,14 @@ export class LocalEdgeKV {
    * database that follows the service and has no local copy downloads one.
    */
   async database(name: string, options: LocalDatabaseOptions = {}): Promise<LocalDatabase> {
-    const { durability, encryptionKey } = options;
+    const { durability, encryptionKey, ingest = false } = options;
     if (encryptionKey !== undefined && encryptionKey.byteLength !== 32) {
       throw new EdgeKVError('BAD_REQUEST', `encryptionKey must be 32 bytes, not ${encryptionKey.byteLength}`, 0);
     }
     const db = await callAsync(() =>
-      this.native.database(name, { durability, encryptionKey: encryptionKey && buf(encryptionKey) }),
+      this.native.database(name, { durability, encryptionKey: encryptionKey && buf(encryptionKey), ingest }),
     );
-    return new LocalDatabase(db);
+    return new LocalDatabase(db, ingest);
   }
 
   /**
@@ -206,22 +213,42 @@ export class LocalEdgeKV {
 /** One database's local copy. Get one from `LocalEdgeKV.database(name)`. */
 export class LocalDatabase {
   /** @internal */
-  constructor(private readonly native: NativeDb) {}
+  constructor(
+    private readonly native: NativeDb,
+    /** Opened with `ingest`: reads go to the service. */
+    readonly ingest = false,
+  ) {}
 
   /** The database's name. */
   get name(): string {
     return this.native.name;
   }
 
-  /** The value stored under `key`, or `null` if there is none. Read from local disk. */
+  /**
+   * The value stored under `key`, or `null` if there is none. Read from
+   * local disk, or from the service when the database was opened with
+   * `ingest`.
+   */
   async get(key: Value): Promise<Uint8Array | null> {
+    if (this.ingest) return (await this.fetch(key))?.value ?? null;
     const value = call(() => this.native.get(buf(key)));
     return value === null || value === undefined ? null : bytes(value);
   }
 
-  /** The value stored under `key` and its version, or `null` if there is none. Read from local disk. */
+  /** The value stored under `key` and its version, or `null` if there is none. Read as `get` reads. */
   async getVersioned(key: Value): Promise<Versioned | null> {
+    if (this.ingest) return this.fetch(key);
     const found = call(() => this.native.getVersioned(buf(key)));
+    return found ? { value: bytes(found.value), version: found.version } : null;
+  }
+
+  /**
+   * The value stored under `key` and its version, read from the service
+   * rather than the local copy: the newest stored value, at the cost of a
+   * request. The key must be text.
+   */
+  async fetch(key: Value): Promise<Versioned | null> {
+    const found = await callAsync(() => this.native.fetch(buf(key)));
     return found ? { value: bytes(found.value), version: found.version } : null;
   }
 
@@ -317,9 +344,21 @@ export class LocalDatabase {
     return new LocalWatch(call(() => this.native.watch(buf(prefix))));
   }
 
-  /** One page of entries in key order. Most callers want `scan`. */
+  /**
+   * One page of entries in key order. Most callers want `scan`. Opened with
+   * `ingest`, it reads from the service, at most 200 entries a page.
+   */
   async scanPage(options: LocalScanOptions & { pageToken?: string } = {}): Promise<Page<Entry>> {
     const limit = options.pageSize ?? 200;
+    if (this.ingest) {
+      const page = await callAsync(() =>
+        this.native.fetchPage(buf(options.prefix ?? ''), Math.min(limit, 200), options.pageToken),
+      );
+      return {
+        items: page.entries.map((entry) => ({ key: decoder.decode(entry.key), keyBytes: bytes(entry.key), value: bytes(entry.value) })),
+        nextPageToken: page.nextPageToken ?? null,
+      };
+    }
     const page = call(() =>
       this.native.scan({
         prefix: options.prefix === undefined ? undefined : buf(options.prefix),

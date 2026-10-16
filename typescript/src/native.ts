@@ -27,7 +27,7 @@ export interface NativeOpenOptions {
 }
 
 export interface NativeKv {
-  database(name: string, options?: { durability?: string; encryptionKey?: Buffer }): Promise<NativeDb>;
+  database(name: string, options?: { durability?: string; encryptionKey?: Buffer; ingest?: boolean }): Promise<NativeDb>;
   close(): Promise<void>;
 }
 
@@ -35,6 +35,12 @@ export interface NativeDb {
   readonly name: string;
   get(key: Buffer): Buffer | null;
   getVersioned(key: Buffer): { value: Buffer; version: string } | null;
+  fetch(key: Buffer): Promise<{ value: Buffer; version: string } | null>;
+  fetchPage(
+    prefix: Buffer,
+    limit: number,
+    pageToken?: string,
+  ): Promise<{ entries: { key: Buffer; value: Buffer }[]; nextPageToken?: string | null }>;
   watch(prefix: Buffer): NativeWatch;
   scan(bounds: { prefix?: Buffer; start?: Buffer; end?: Buffer; after?: Buffer; limit?: number }): { key: Buffer; value: Buffer }[];
   commit(

@@ -62,6 +62,16 @@ pub struct DatabaseOptions {
     pub durability: Option<String>,
     /// 32 bytes. Values are sealed with it before they are stored anywhere.
     pub encryption_key: Option<Buffer>,
+    /// Keep no local copy: buffer writes, upload them, read from the service.
+    pub ingest: Option<bool>,
+}
+
+/// One page read from the service.
+#[napi(object)]
+pub struct NativeFetchPage {
+    pub entries: Vec<NativeEntry>,
+    /// Pass back to continue; absent when there is no more.
+    pub next_page_token: Option<String>,
 }
 
 /// One write in a batch.
@@ -231,8 +241,8 @@ impl NativeKv {
         name: String,
         options: Option<DatabaseOptions>,
     ) -> napi::Result<NativeDb> {
-        let (mode, key) = match options {
-            None => (None, None),
+        let (mode, key, ingest) = match options {
+            None => (None, None, false),
             Some(o) => {
                 let key = match o.encryption_key {
                     None => None,
@@ -240,13 +250,22 @@ impl NativeKv {
                         invalid(format!("encryptionKey must be 32 bytes, not {}", k.len()))
                     })?),
                 };
-                (durability(o.durability.as_deref())?, key)
+                (
+                    durability(o.durability.as_deref())?,
+                    key,
+                    o.ingest.unwrap_or(false),
+                )
             }
         };
         let mut builder = match name.split_once('/') {
             Some((namespace, name)) => self.kv.namespace(namespace).database(name),
             None => self.kv.database(&name),
         };
+        // Before the durability, which ingesting changes to buffered unless
+        // the caller asked for another.
+        if ingest {
+            builder = builder.ingest();
+        }
         if let Some(d) = mode {
             builder = builder.durability(d);
         }
@@ -295,6 +314,46 @@ impl NativeDb {
                 value: value.into(),
                 version: version.to_string(),
             }))
+    }
+
+    /// Reads a key and its version from the service, not the local copy.
+    #[napi]
+    pub async fn fetch(&self, key: Buffer) -> napi::Result<Option<NativeVersioned>> {
+        Ok(self
+            .db
+            .fetch_versioned(&key)
+            .await
+            .map_err(fail)?
+            .map(|(value, version)| NativeVersioned {
+                value: value.into(),
+                version: version.to_string(),
+            }))
+    }
+
+    /// One page of keys under `prefix`, read from the service.
+    #[napi]
+    pub async fn fetch_page(
+        &self,
+        prefix: Buffer,
+        limit: u32,
+        page_token: Option<String>,
+    ) -> napi::Result<NativeFetchPage> {
+        let page = self
+            .db
+            .fetch_page(&prefix, limit as usize, page_token.as_deref())
+            .await
+            .map_err(fail)?;
+        Ok(NativeFetchPage {
+            entries: page
+                .entries
+                .into_iter()
+                .map(|(key, value)| NativeEntry {
+                    key: key.into(),
+                    value: value.into(),
+                })
+                .collect(),
+            next_page_token: page.next_page_token,
+        })
     }
 
     /// Reports changes under `prefix` as they reach the local copy.

@@ -1981,7 +1981,7 @@ dependencies = [
 [[package]]
 name = "valkvedge"
 version = "0.1.0"
-source = "git+https://github.com/VALKV-LABS/libvalkvedge?rev=a46d49b985c21db3249e2723b5be64823404eeb1#a46d49b985c21db3249e2723b5be64823404eeb1"
+source = "git+https://github.com/VALKV-LABS/libvalkvedge?rev=bfc93aa2f33ad36e3525e01b3eaf93c2dfdfdfc1#bfc93aa2f33ad36e3525e01b3eaf93c2dfdfdfc1"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -1999,7 +1999,7 @@ dependencies = [
 [[package]]
 name = "valkvedge-log"
 version = "0.1.0"
-source = "git+https://github.com/VALKV-LABS/libvalkvedge?rev=a46d49b985c21db3249e2723b5be64823404eeb1#a46d49b985c21db3249e2723b5be64823404eeb1"
+source = "git+https://github.com/VALKV-LABS/libvalkvedge?rev=bfc93aa2f33ad36e3525e01b3eaf93c2dfdfdfc1#bfc93aa2f33ad36e3525e01b3eaf93c2dfdfdfc1"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2016,7 +2016,7 @@ dependencies = [
 [[package]]
 name = "valkvedge-sync"
 version = "0.1.0"
-source = "git+https://github.com/VALKV-LABS/libvalkvedge?rev=a46d49b985c21db3249e2723b5be64823404eeb1#a46d49b985c21db3249e2723b5be64823404eeb1"
+source = "git+https://github.com/VALKV-LABS/libvalkvedge?rev=bfc93aa2f33ad36e3525e01b3eaf93c2dfdfdfc1#bfc93aa2f33ad36e3525e01b3eaf93c2dfdfdfc1"
 dependencies = [
  "tokio",
  "tracing",

@@ -246,3 +246,22 @@ test('tokens replace the API key, and are asked for by database name', async () 
   assert.deepEqual([...new Set(asked)], ['notes-user-1']);
   await kv.close();
 });
+
+test('ingesting needs a service, downloads nothing, and buffers writes while it is away', async () => {
+  const local = await LocalEdgeKV.open({ path: fresh() });
+  await rejectsWith(local.database('readings', { ingest: true }), 'UNSUPPORTED');
+  await local.close();
+
+  // Nothing listens here: an ordinary open would try to download, but
+  // opening to ingest makes no request at all.
+  const kv = await LocalEdgeKV.open({ path: fresh(), url: 'http://127.0.0.1:9', apiKey: 'ekv_test' });
+  const db = await kv.database('readings', { ingest: true });
+  assert.equal(db.ingest, true);
+  const written = await db.put('temp/1', '20.5');
+  assert.equal(written.lsn, null, 'buffered by default');
+  assert.equal(db.status().outboxEntries, 1);
+  // Reads go to the service, which cannot be reached; watching is not offered.
+  await rejectsWith(db.get('temp/1'), 'UNAVAILABLE');
+  assert.throws(() => db.watch(), { code: 'UNSUPPORTED' });
+  await kv.close();
+});
