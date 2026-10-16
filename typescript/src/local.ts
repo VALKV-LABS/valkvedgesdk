@@ -345,7 +345,7 @@ export class LocalDatabase {
   }
 
   /**
-   * Pushes buffered writes and pulls what other devices wrote. Returns the
+   * Pushes buffered writes and pulls what other replicas wrote. Returns the
    * local copy's log position. This also happens in the background, about
    * once a second; call it when you need it now.
    */

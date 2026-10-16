@@ -6,7 +6,7 @@
 
 mod client;
 
-use client::{ApiError, ApiResult, Client, Connection, Database, Device, EntryPage};
+use client::{ApiError, ApiResult, Client, Connection, Database, EntryPage, Replica};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -183,7 +183,7 @@ async fn list_databases(state: State<'_, AppState>) -> ApiResult<Vec<Database>> 
 #[derive(Serialize)]
 struct DatabaseDetails {
     database: Database,
-    devices: Vec<Device>,
+    replicas: Vec<Replica>,
     /// Where the database's history ends, or `None` if the data API would not
     /// say (a database created seconds ago, for instance).
     lsn: Option<u64>,
@@ -193,11 +193,11 @@ struct DatabaseDetails {
 async fn database_details(state: State<'_, AppState>, id: String) -> ApiResult<DatabaseDetails> {
     let client = state.client()?;
     let database = client.database(&id).await?;
-    let devices = client.devices(&id).await?;
+    let replicas = client.replicas(&id).await?;
     let lsn = client.head(&database.name).await.ok();
     Ok(DatabaseDetails {
         database,
-        devices,
+        replicas,
         lsn,
     })
 }

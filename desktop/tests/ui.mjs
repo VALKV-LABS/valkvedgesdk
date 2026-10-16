@@ -1,6 +1,6 @@
 // Drives the built application through its real window, against a running
 // service: connects, creates a database, writes, edits, filters and deletes
-// entries, checks the devices list, restarts, and deletes the database.
+// entries, checks the replicas list, restarts, and deletes the database.
 //
 // Windows only: it reaches the window through the debugging port of the
 // system web view. Needs Node 22 or later.
@@ -267,32 +267,32 @@ async function run() {
   pass('an entry is deleted', !(await rows()).some((row) => row[0] === 'order/1002'))
   pass('and is gone from the service', (await service(API, `/v1/db/${name}/kv/order/1002`)).status === 404)
 
-  // Devices: none yet, then one that pushed.
-  await click('[data-testid=devices-tab]')
-  pass('no devices at first', await exists('[data-testid=no-devices]'))
-  const device = '0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f'
+  // Replicas: none yet, then one that pushed.
+  await click('[data-testid=replicas-tab]')
+  pass('no replicas at first', await exists('[data-testid=no-replicas]'))
+  const replica = '0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f'
   const b64 = (value) => Buffer.from(value).toString('base64')
   const pushed = await service(API, `/v1/db/${name}/push`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ device_id: device, entries: [{ seq: 1, ops: [{ op: 'put', key: b64('from-device'), value: b64('hi'), hlc: { ms: Date.now() } }] }] }),
+    body: JSON.stringify({ replica_id: replica, entries: [{ seq: 1, ops: [{ op: 'put', key: b64('from-replica'), value: b64('hi'), hlc: { ms: Date.now() } }] }] }),
   })
-  pass('a device pushes a write to the service', pushed.status === 200, String(pushed.status))
-  // The service learns of devices in the background; ask again until it has.
+  pass('a replica pushes a write to the service', pushed.status === 200, String(pushed.status))
+  // The service learns of replicas in the background; ask again until it has.
   await page(`document.querySelector('[data-tab=data]').click()`)
   let seen = false
   for (let i = 0; i < 40 && !seen; i += 1) {
     await click('[data-testid=refresh]')
     await settled()
-    await click('[data-testid=devices-tab]')
-    seen = await exists('[data-testid=devices]')
+    await click('[data-testid=replicas-tab]')
+    seen = await exists('[data-testid=replicas]')
     if (!seen) {
       await page(`document.querySelector('[data-tab=data]').click()`)
       await sleep(500)
     }
   }
-  pass('the device is listed', seen && (await text('[data-testid=devices] tbody tr td')) === device)
-  await screenshot('3-devices')
+  pass('the replica is listed', seen && (await text('[data-testid=replicas] tbody tr td')) === replica)
+  await screenshot('3-replicas')
 
   // Restart: the connection is remembered, and the key was not typed again.
   await quit()

@@ -18,7 +18,7 @@ interface Database {
   created_at: string
   stored_bytes: number | null
 }
-interface Device {
+interface Replica {
   id: string
   last_seen_at: string
   lsn: number | null
@@ -41,9 +41,9 @@ interface Open {
   id: string | null
   name: string
   details: Database | null
-  devices: Device[]
+  replicas: Replica[]
   lsn: number | null
-  tab: 'data' | 'devices'
+  tab: 'data' | 'replicas'
   prefix: string
   entries: Entry[]
   nextPageToken: string | null
@@ -151,7 +151,7 @@ async function openDatabase(id: string | null, name: string) {
     id,
     name,
     details: null,
-    devices: [],
+    replicas: [],
     lsn: null,
     tab: 'data',
     prefix: '',
@@ -169,9 +169,9 @@ async function refreshOpen(done?: string) {
   if (!open) return
   await attempt(async () => {
     if (open.id) {
-      const details = await invoke<{ database: Database; devices: Device[]; lsn: number | null }>('database_details', { id: open.id })
+      const details = await invoke<{ database: Database; replicas: Replica[]; lsn: number | null }>('database_details', { id: open.id })
       open.details = details.database
-      open.devices = details.devices
+      open.replicas = details.replicas
       open.lsn = details.lsn
     } else {
       open.lsn = await invoke<number>('probe_database', { name: open.name })
@@ -419,22 +419,22 @@ function dataTab(open: Open): string {
   }`
 }
 
-function devicesTab(open: Open): string {
-  if (!open.id) return '<p class="muted pad">Devices are listed for keys that can manage databases.</p>'
-  if (open.devices.length === 0) {
-    return '<p class="muted pad" data-testid="no-devices">No device has synced this database yet. A device is listed once it syncs with the library.</p>'
+function replicasTab(open: Open): string {
+  if (!open.id) return '<p class="muted pad">Replicas are listed for keys that can manage databases.</p>'
+  if (open.replicas.length === 0) {
+    return '<p class="muted pad" data-testid="no-replicas">No replica has synced this database yet. A replica is listed once it syncs with the library.</p>'
   }
   return `
-  <table data-testid="devices">
-    <thead><tr><th>Device</th><th>Status</th><th>Behind</th><th>Last seen</th></tr></thead>
-    <tbody>${open.devices
+  <table data-testid="replicas">
+    <thead><tr><th>Replica</th><th>Status</th><th>Behind</th><th>Last seen</th></tr></thead>
+    <tbody>${open.replicas
       .map(
-        (device) => `
+        (replica) => `
       <tr>
-        <td class="mono">${escape(device.id)}</td>
-        <td><span class="tag ${device.connected ? 'ok' : ''}">${device.connected ? 'connected' : 'offline'}</span></td>
-        <td>${lagText(device.lag)}</td>
-        <td class="muted">${escape(formatTime(device.last_seen_at))}</td>
+        <td class="mono">${escape(replica.id)}</td>
+        <td><span class="tag ${replica.connected ? 'ok' : ''}">${replica.connected ? 'connected' : 'offline'}</span></td>
+        <td>${lagText(replica.lag)}</td>
+        <td class="muted">${escape(formatTime(replica.last_seen_at))}</td>
       </tr>`,
       )
       .join('')}</tbody>
@@ -473,9 +473,9 @@ function content(): string {
     </header>
     <nav class="tabs">
       <button class="${open.tab === 'data' ? 'selected' : ''}" data-tab="data">Data</button>
-      <button class="${open.tab === 'devices' ? 'selected' : ''}" data-tab="devices" data-testid="devices-tab">Devices${open.devices.length ? ` (${open.devices.length})` : ''}</button>
+      <button class="${open.tab === 'replicas' ? 'selected' : ''}" data-tab="replicas" data-testid="replicas-tab">Replicas${open.replicas.length ? ` (${open.replicas.length})` : ''}</button>
     </nav>
-    ${open.tab === 'data' ? dataTab(open) : devicesTab(open)}
+    ${open.tab === 'data' ? dataTab(open) : replicasTab(open)}
   </section>`
 }
 

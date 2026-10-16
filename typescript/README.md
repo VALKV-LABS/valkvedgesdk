@@ -202,12 +202,12 @@ then also be `namespace/name`, to keep one user's or one tenant's databases toge
 - **`buffered`** returns once the write is on local disk. It is readable at once, works
   without a network, and is pushed to the service in the background within a few
   seconds. It can be lost if the machine is lost before then, and it can lose to a
-  newer write of the same key from another device: the newer write wins, and
+  newer write of the same key from another replica: the newer write wins, and
   `db.takeEvents()` reports the one that lost.
 
 Set the default for a database with `kv.database(name, { durability: 'buffered' })`.
 
-What other devices write reaches the local copy in the background, about once a second.
+What other replicas write reaches the local copy in the background, about once a second.
 `db.sync()` pushes and pulls now; `db.status()` shows how many buffered writes are still
 waiting.
 

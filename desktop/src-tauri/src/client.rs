@@ -55,7 +55,7 @@ pub struct Database {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Device {
+pub struct Replica {
     pub id: String,
     pub last_seen_at: String,
     pub lsn: Option<u64>,
@@ -282,16 +282,16 @@ impl Client {
         self.send(self.http.delete(url)).await.map(|_| ())
     }
 
-    /// The devices most recently seen syncing a database.
-    pub async fn devices(&self, id: &str) -> ApiResult<Vec<Device>> {
-        let url = self.control(&format!("/v1/databases/{}/devices", path_segment(id)));
+    /// The replicas most recently seen syncing a database.
+    pub async fn replicas(&self, id: &str) -> ApiResult<Vec<Replica>> {
+        let url = self.control(&format!("/v1/databases/{}/replicas", path_segment(id)));
         let reply = self
             .send(self.http.get(url).query(&[("limit", "200")]))
             .await?;
         serde_json::from_value(reply["items"].clone()).map_err(|_| {
             ApiError::local(
                 "SERVICE_ERROR",
-                "the service sent devices that could not be read",
+                "the service sent replicas that could not be read",
             )
         })
     }
@@ -591,7 +591,7 @@ mod integration {
 
         let details = client.database(&created.id).await.unwrap();
         assert!(details.stored_bytes.is_some());
-        assert!(client.devices(&created.id).await.unwrap().is_empty());
+        assert!(client.replicas(&created.id).await.unwrap().is_empty());
 
         client.delete_database(&created.id).await.unwrap();
         assert_eq!(
