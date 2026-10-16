@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
-import { EdgeKVError, LocalEdgeKV } from '../src/index.js';
+import { EdgeKVError, LocalEdgeKV, type ChangeEvent } from '../src/index.js';
 
 const dirs: string[] = [];
 after(() => {
@@ -141,5 +141,108 @@ test('failures carry the library code', async () => {
   await rejectsWith(db.put('k', new Uint8Array(1024 * 1024 + 1)), 'VALUE_TOO_LARGE');
   await rejectsWith(LocalEdgeKV.open({ path: fresh(), url: 'https://api.test' }), 'BAD_REQUEST');
   await rejectsWith(LocalEdgeKV.open({ path: fresh(), url: 'https://api.test', apiKey: 'nope' }), 'BAD_REQUEST');
+  await kv.close();
+});
+
+test('writes report versions, and a stale version or an existing key fails the write', async () => {
+  const kv = await LocalEdgeKV.open({ path: fresh() });
+  const db = await kv.database('shop');
+  const first = await db.put('stock/1', '10');
+  assert.equal(first.versions.length, 1);
+  const read = await db.getVersioned('stock/1');
+  assert.deepEqual(read, { value: new TextEncoder().encode('10'), version: first.versions[0] });
+  assert.equal(await db.getVersioned('stock/none'), null);
+
+  const second = await db.put('stock/1', '9', { ifVersion: read!.version });
+  assert.notEqual(second.versions[0], read!.version);
+  // Someone holding the first version now loses, and nothing is written.
+  await rejectsWith(db.put('stock/1', '8', { ifVersion: read!.version }), 'CONDITION_FAILED');
+  await rejectsWith(db.delete('stock/1', { ifVersion: read!.version }), 'CONDITION_FAILED');
+  assert.equal(await db.getText('stock/1'), '9');
+
+  await rejectsWith(db.put('stock/1', 'new', { ifAbsent: true }), 'CONDITION_FAILED');
+  await db.put('stock/2', 'new', { ifAbsent: true });
+
+  // A commit with a failed condition writes none of its operations.
+  await rejectsWith(
+    db.commit([{ op: 'put', key: 'order/1', value: 'x' }, { op: 'put', key: 'stock/1', value: '7' }], {
+      conditions: [{ key: 'stock/1', version: read!.version }],
+    }),
+    'CONDITION_FAILED',
+  );
+  assert.equal(await db.get('order/1'), null);
+  const ok = await db.commit([{ op: 'put', key: 'order/1', value: 'x' }, { op: 'delete', key: 'stock/2' }], {
+    conditions: [{ key: 'stock/1', version: second.versions[0]! }, { key: 'order/1', version: null }],
+  });
+  assert.equal(ok.versions.length, 2);
+
+  // Without a service the local copy is the database, so even a buffered write is checked.
+  // (Following a service, a buffered write cannot carry a condition: UNSUPPORTED.)
+  await rejectsWith(db.put('stock/1', '1', { durability: 'buffered', ifVersion: read!.version }), 'CONDITION_FAILED');
+  await rejectsWith(db.put('stock/1', '1', { ifVersion: 'not a version' }), 'INVALID_ARGUMENT');
+  await kv.close();
+});
+
+test('update loses no increments when many run at once', async () => {
+  const kv = await LocalEdgeKV.open({ path: fresh() });
+  const db = await kv.database('counters');
+  const increment = (current: Uint8Array | null) => String(Number(current ? new TextDecoder().decode(current) : '0') + 1);
+  await Promise.all(Array.from({ length: 10 }, () => db.update('hits', increment)));
+  assert.equal(await db.getText('hits'), '10');
+  // Null deletes; null on nothing writes nothing.
+  assert.ok(await db.update('hits', () => null));
+  assert.equal(await db.get('hits'), null);
+  assert.equal(await db.update('hits', () => null), null);
+  await kv.close();
+});
+
+test('watch reports changes under its prefix until it is closed', async () => {
+  const kv = await LocalEdgeKV.open({ path: fresh() });
+  const db = await kv.database('feed');
+  const watch = db.watch('post/');
+  const events: ChangeEvent[] = [];
+  const done = (async () => {
+    for await (const event of watch) {
+      events.push(event);
+      if (events.length === 3) break;
+    }
+  })();
+  await db.put('post/1', 'hello');
+  await db.put('other/1', 'not watched');
+  await db.put('post/2', 'there', { durability: 'buffered' });
+  await db.delete('post/1');
+  await done;
+  assert.deepEqual(
+    events.map((e) => (e.type === 'changed' ? [e.key, e.value && new TextDecoder().decode(e.value)] : ['reset'])),
+    [['post/1', 'hello'], ['post/2', 'there'], ['post/1', null]],
+  );
+
+  // close() ends a watch that is waiting.
+  const idle = db.watch();
+  const pending = idle.next();
+  idle.close();
+  assert.deepEqual(await pending, { done: true, value: undefined });
+  assert.deepEqual(await idle.next(), { done: true, value: undefined });
+  await kv.close();
+});
+
+test('tokens replace the API key, and are asked for by database name', async () => {
+  await rejectsWith(LocalEdgeKV.open({ path: fresh(), tokens: async () => 't' }), 'BAD_REQUEST');
+  await rejectsWith(
+    LocalEdgeKV.open({ path: fresh(), url: 'https://api.test', apiKey: 'ekv_k', tokens: async () => 't' }),
+    'BAD_REQUEST',
+  );
+  // Nothing listens here, so opening fails, but only after asking for a token.
+  const asked: string[] = [];
+  const kv = await LocalEdgeKV.open({
+    path: fresh(),
+    url: 'http://127.0.0.1:9',
+    tokens: (database) => {
+      asked.push(database);
+      return 'eyJ.e30.x';
+    },
+  });
+  await assert.rejects(kv.database('notes-user-1'));
+  assert.deepEqual([...new Set(asked)], ['notes-user-1']);
   await kv.close();
 });

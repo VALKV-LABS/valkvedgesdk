@@ -8,10 +8,17 @@
 //! is the library's stable code; the TypeScript side turns that into an
 //! `EdgeKVError`.
 
-use napi::bindgen_prelude::Buffer;
+use napi::bindgen_prelude::{Buffer, Function, Promise};
+use napi::threadsafe_function::ThreadsafeFunction;
+use napi::Status;
 use napi_derive::napi;
 use std::ops::Bound;
-use valkvedge::{Durability, ValkvEdge, ValkvEdgeError, WriteOutcome};
+use std::sync::Arc;
+use valkvedge::{Durability, ValkvEdge, ValkvEdgeError, Version, WatchEvent, WriteOutcome};
+
+/// The application's token source, callable from any thread. Weak, so it
+/// never keeps the Node.js process alive on its own.
+type TokenFn = ThreadsafeFunction<String, Promise<String>, String, Status, false, true>;
 
 /// Largest page `scan` returns.
 const MAX_PAGE: u32 = 1000;
@@ -67,6 +74,14 @@ pub struct NativeOp {
     pub value: Option<Buffer>,
 }
 
+/// A requirement on one key for a conditional commit.
+#[napi(object)]
+pub struct NativeCondition {
+    pub key: Buffer,
+    /// The version the key's value must be at; `null`: it must have no value.
+    pub version: Option<String>,
+}
+
 /// What a write returned.
 #[napi(object)]
 pub struct NativeCommit {
@@ -74,6 +89,26 @@ pub struct NativeCommit {
     pub lsn: Option<i64>,
     /// The outbox sequence number, for a buffered write.
     pub outbox_seq: Option<i64>,
+    /// The version each write gave its key, in order.
+    pub versions: Vec<String>,
+}
+
+/// A value and its version.
+#[napi(object)]
+pub struct NativeVersioned {
+    pub value: Buffer,
+    pub version: String,
+}
+
+/// One change reported by a watch.
+#[napi(object)]
+pub struct NativeWatchEvent {
+    /// True when any key may have changed: read again what you show.
+    pub reset: bool,
+    /// The key that changed, unless `reset`.
+    pub key: Option<Buffer>,
+    /// Its value now; absent when it has none.
+    pub value: Option<Buffer>,
 }
 
 #[napi(object)]
@@ -139,6 +174,54 @@ pub async fn open_kv(options: OpenOptions) -> napi::Result<NativeKv> {
     })
 }
 
+/// Opens a directory of databases that follow a hosted service with access
+/// tokens instead of an API key. `tokens` is called with a database name and
+/// returns a promise of a token for it; it is called again shortly before a
+/// token expires and whenever the service refuses one.
+///
+/// Not async: the token function has to be wrapped on the JavaScript thread.
+#[napi]
+pub fn open_kv_with_tokens(
+    options: OpenOptions,
+    tokens: Function<String, Promise<String>>,
+) -> napi::Result<NativeKv> {
+    let Some(url) = options.url else {
+        return Err(invalid("url is required with tokens"));
+    };
+    if options.api_key.is_some() {
+        return Err(invalid("give apiKey or tokens, not both"));
+    }
+    let source: Arc<TokenFn> = Arc::new(
+        tokens
+            .build_threadsafe_function::<String>()
+            .callee_handled::<false>()
+            .weak::<true>()
+            .build()?,
+    );
+    let mut builder = ValkvEdge::builder(options.path);
+    if let Some(n) = options.max_open_databases {
+        builder = builder.max_open_databases(n as usize);
+    }
+    builder = builder.remote_with_tokens(url, move |database: String| {
+        let source = source.clone();
+        async move {
+            let unavailable = |e: napi::Error| {
+                ValkvEdgeError::Unavailable(format!("the token source failed: {e}"))
+            };
+            let promise = source
+                .call_async_catch(database)
+                .await
+                .map_err(unavailable)?;
+            promise.await.map_err(unavailable)
+        }
+    });
+    // The background task starts on the runtime the bindings own.
+    let kv = napi::bindgen_prelude::within_runtime_if_available(|| builder.build());
+    Ok(NativeKv {
+        kv: kv.map_err(fail)?,
+    })
+}
+
 #[napi]
 impl NativeKv {
     /// Opens `name`, or `namespace/name`.
@@ -201,6 +284,30 @@ impl NativeDb {
         Ok(self.db.get(&key).map_err(fail)?.map(Buffer::from))
     }
 
+    /// Reads a key and the version of its value from the local copy.
+    #[napi]
+    pub fn get_versioned(&self, key: Buffer) -> napi::Result<Option<NativeVersioned>> {
+        Ok(self
+            .db
+            .get_versioned(&key)
+            .map_err(fail)?
+            .map(|(value, version)| NativeVersioned {
+                value: value.into(),
+                version: version.to_string(),
+            }))
+    }
+
+    /// Reports changes under `prefix` as they reach the local copy.
+    #[napi]
+    pub fn watch(&self, prefix: Buffer) -> napi::Result<NativeWatch> {
+        let watch = self.db.watch(&prefix).map_err(fail)?;
+        let (closed, _) = tokio::sync::watch::channel(false);
+        Ok(NativeWatch {
+            watch: Arc::new(tokio::sync::Mutex::new(Some(watch))),
+            closed,
+        })
+    }
+
     /// One page of keys in order, from the local copy.
     #[napi]
     pub fn scan(&self, bounds: ScanBounds) -> napi::Result<Vec<NativeEntry>> {
@@ -242,12 +349,14 @@ impl NativeDb {
         Ok(page)
     }
 
-    /// Applies every operation, or none of them.
+    /// Applies every operation, or none of them; with `conditions`, only if
+    /// each holds.
     #[napi]
     pub async fn commit(
         &self,
         ops: Vec<NativeOp>,
         mode: Option<String>,
+        conditions: Option<Vec<NativeCondition>>,
     ) -> napi::Result<NativeCommit> {
         let mode = durability(mode.as_deref())?;
         let mut batch = self.db.batch();
@@ -259,6 +368,17 @@ impl NativeDb {
                 batch.put(&op.key, value);
             }
         }
+        for condition in conditions.iter().flatten() {
+            match &condition.version {
+                None => batch.if_absent(&condition.key),
+                Some(text) => {
+                    let version: Version = text
+                        .parse()
+                        .map_err(|_| invalid(format!("{text:?} is not a version")))?;
+                    batch.if_version(&condition.key, &version)
+                }
+            };
+        }
         let commit = match mode {
             Some(d) => batch.commit_with(d).await,
             None => batch.commit().await,
@@ -267,6 +387,7 @@ impl NativeDb {
         Ok(NativeCommit {
             lsn: commit.lsn.map(|l| l as i64),
             outbox_seq: commit.outbox_seq.map(|s| s as i64),
+            versions: commit.versions.iter().map(Version::to_string).collect(),
         })
     }
 
@@ -311,6 +432,61 @@ impl NativeDb {
                 },
             })
             .collect()
+    }
+}
+
+/// A subscription to changes under a prefix. Keeps its database open until
+/// closed.
+#[napi]
+pub struct NativeWatch {
+    // `None` once closed.
+    watch: Arc<tokio::sync::Mutex<Option<valkvedge::Watch>>>,
+    closed: tokio::sync::watch::Sender<bool>,
+}
+
+#[napi]
+impl NativeWatch {
+    /// The next change, or `null` once the watch is closed.
+    #[napi]
+    pub async fn next(&self) -> napi::Result<Option<NativeWatchEvent>> {
+        let mut closing = self.closed.subscribe();
+        if *closing.borrow() {
+            return Ok(None);
+        }
+        let mut slot = self.watch.lock().await;
+        let Some(watch) = slot.as_mut() else {
+            return Ok(None);
+        };
+        let event = tokio::select! {
+            event = watch.next() => event.map_err(fail)?,
+            _ = closing.wait_for(|closed| *closed) => {
+                *slot = None;
+                return Ok(None);
+            }
+        };
+        Ok(Some(match event {
+            WatchEvent::Reset => NativeWatchEvent {
+                reset: true,
+                key: None,
+                value: None,
+            },
+            WatchEvent::Changed { key, value } => NativeWatchEvent {
+                reset: false,
+                key: Some(key.into()),
+                value: value.map(Buffer::from),
+            },
+        }))
+    }
+
+    /// Stops the watch. A pending `next` returns `null`.
+    #[napi]
+    pub fn close(&self) {
+        self.closed.send_replace(true);
+        // If nothing is waiting, release the database now; otherwise the
+        // waiting `next` does on its way out.
+        if let Ok(mut slot) = self.watch.try_lock() {
+            *slot = None;
+        }
     }
 }
 

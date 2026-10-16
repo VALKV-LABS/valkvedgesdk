@@ -1,7 +1,7 @@
 // Tests of the client against a stand-in for `fetch`. No network.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { EdgeKV, EdgeKVError } from '../src/index.js';
+import { EdgeKV, EdgeKVError, UPDATE_ATTEMPTS, tokenRefreshAt, type TokenSource } from '../src/index.js';
 
 interface Seen {
   method: string;
@@ -13,7 +13,7 @@ interface Seen {
 type Answer = { status?: number; json?: unknown; bytes?: Uint8Array; headers?: Record<string, string> } | Error;
 
 /** A client whose requests are answered from a list, in order, and recorded. */
-function client(answers: Answer[], options: { retries?: number; controlUrl?: string } = {}) {
+function client(answers: Answer[], options: { retries?: number; controlUrl?: string; tokens?: TokenSource } = {}) {
   const seen: Seen[] = [];
   const fake = async (input: URL | RequestInfo, init?: RequestInit): Promise<Response> => {
     seen.push({
@@ -29,7 +29,7 @@ function client(answers: Answer[], options: { retries?: number; controlUrl?: str
     return new Response(body as BodyInit | undefined, { status: answer.status ?? 200, headers: answer.headers });
   };
   const kv = new EdgeKV({
-    apiKey: 'ekv_test_key',
+    ...(options.tokens ? { tokens: options.tokens } : { apiKey: 'ekv_test_key' }),
     url: 'https://api.test/',
     controlUrl: options.controlUrl,
     retries: options.retries ?? 0,
@@ -210,4 +210,186 @@ test('the local mode picks the native package for the platform', async () => {
   assert.equal(platformSuffix('win32', 'x64', false), 'win32-x64-msvc');
   assert.equal(platformSuffix('win32', 'arm64', false), null);
   assert.equal(platformSuffix('freebsd', 'x64', false), null);
+});
+
+test('a write can require the version it read, or that the key has no value', async () => {
+  const { kv, seen } = client([
+    { json: { lsn: 5, version: 'v2' } },
+    { json: { lsn: 6, version: 'v1' } },
+    { json: { lsn: 7 } },
+    { json: { lsn: 8 } },
+    { json: { lsn: 9, versions: ['v3', 'v4'] } },
+  ]);
+  const db = kv.database('shop');
+  assert.deepEqual(await db.put('stock/1', '9', { ifVersion: 'v1' }), { lsn: 5, version: 'v2' });
+  assert.equal(seen[0]!.headers['if-match'], 'v1');
+  await db.put('stock/2', '1', { ifAbsent: true });
+  assert.equal(seen[1]!.headers['if-none-match'], '*');
+  await db.delete('stock/2', { ifVersion: 'v1' });
+  assert.deepEqual([seen[2]!.method, seen[2]!.headers['if-match']], ['DELETE', 'v1']);
+  await db.put('stock/3', 'x');
+  assert.equal(seen[3]!.headers['if-match'], undefined);
+  assert.equal(seen[3]!.headers['if-none-match'], undefined);
+
+  const result = await db.commit([{ op: 'put', key: 'a', value: '1' }, { op: 'delete', key: 'b' }], {
+    conditions: [{ key: 'a', version: 'v2' }, { key: 'b', version: null }],
+  });
+  assert.deepEqual(result.versions, ['v3', 'v4']);
+  assert.deepEqual(JSON.parse(seen[4]!.body as string).conditions, [{ key: b64('a'), version: 'v2' }, { key: b64('b'), version: null }]);
+
+  await assert.rejects(db.put('k', 'v', { ifVersion: 'v1', ifAbsent: true }), { code: 'BAD_REQUEST' });
+  assert.equal(seen.length, 5);
+});
+
+test('getVersioned returns the version the service sends with the value', async () => {
+  const { kv } = client([{ bytes: new TextEncoder().encode('10'), headers: { 'x-edgekv-version': 'v7' } }, failure(404, 'KEY_NOT_FOUND')]);
+  assert.deepEqual(await kv.database('shop').getVersioned('stock/1'), { value: new TextEncoder().encode('10'), version: 'v7' });
+  assert.equal(await kv.database('shop').getVersioned('stock/2'), null);
+});
+
+test('a failed condition is reported with the key that did not hold, and is not retried', async () => {
+  const { kv, seen } = client([{ status: 412, json: { error: { code: 'CONDITION_FAILED', message: 'changed', key: b64('stock/1') } } }], {
+    retries: 3,
+  });
+  await assert.rejects(kv.database('shop').put('stock/1', '9', { ifVersion: 'v1' }), (error: EdgeKVError) => {
+    assert.equal(error.code, 'CONDITION_FAILED');
+    assert.equal(error.status, 412);
+    assert.deepEqual(error.key, new TextEncoder().encode('stock/1'));
+    return true;
+  });
+  assert.equal(seen.length, 1);
+});
+
+test('update reads, changes and writes back, reading again when someone else wrote first', async () => {
+  const value = (text: string, version: string) => ({ bytes: new TextEncoder().encode(text), headers: { 'x-edgekv-version': version } });
+  const conflict = failure(412, 'CONDITION_FAILED');
+  const { kv, seen } = client([value('10', 'v1'), conflict, value('12', 'v2'), { json: { lsn: 3, version: 'v3' } }]);
+  const seenValues: string[] = [];
+  const result = await kv.database('shop').update('stock/1', (current) => {
+    const text = new TextDecoder().decode(current!);
+    seenValues.push(text);
+    return String(Number(text) - 1);
+  });
+  assert.deepEqual(result, { lsn: 3, version: 'v3' });
+  assert.deepEqual(seenValues, ['10', '12']);
+  assert.deepEqual([seen[1]!.headers['if-match'], seen[3]!.headers['if-match']], ['v1', 'v2']);
+  assert.deepEqual(seen[3]!.body, new TextEncoder().encode('11'));
+});
+
+test('update creates only if absent, deletes on null, and does nothing for null on nothing', async () => {
+  const { kv, seen } = client([
+    failure(404, 'KEY_NOT_FOUND'),
+    { json: { lsn: 1, version: 'v1' } },
+    { bytes: new Uint8Array([1]), headers: { 'x-edgekv-version': 'v1' } },
+    { json: { lsn: 2 } },
+    failure(404, 'KEY_NOT_FOUND'),
+  ]);
+  const db = kv.database('shop');
+  await db.update('counter', (current) => (current === null ? '1' : null));
+  assert.equal(seen[1]!.headers['if-none-match'], '*');
+  await db.update('counter', () => null);
+  assert.deepEqual([seen[3]!.method, seen[3]!.headers['if-match']], ['DELETE', 'v1']);
+  assert.equal(await db.update('counter', () => null), null);
+  assert.equal(seen.length, 5);
+});
+
+test('update gives up with CONDITION_FAILED when the key keeps changing', async () => {
+  const answers: Answer[] = [];
+  for (let i = 0; i < UPDATE_ATTEMPTS; i += 1) {
+    answers.push({ bytes: new Uint8Array([i]), headers: { 'x-edgekv-version': `v${i}` } }, failure(412, 'CONDITION_FAILED'));
+  }
+  const { kv, seen } = client(answers);
+  await assert.rejects(kv.database('shop').update('hot', () => 'x'), { code: 'CONDITION_FAILED' });
+  assert.equal(seen.length, UPDATE_ATTEMPTS * 2);
+});
+
+/** A token that expires `seconds` from now, in the shape the service mints (only `exp` is read). */
+function jwt(seconds: number, id = 'a'): string {
+  const part = (value: object) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  return `${part({ alg: 'HS256' })}.${part({ exp: Math.floor(Date.now() / 1000) + seconds, jti: id })}.sig`;
+}
+
+test('with tokens, each database gets its own token from the source, fetched once', async () => {
+  const issued = new Map<string, string>();
+  const tokens: TokenSource = async (database) => {
+    assert.ok(!issued.has(database), `asked twice for ${database}`);
+    issued.set(database, jwt(3600, database));
+    return issued.get(database)!;
+  };
+  const { kv, seen } = client([{ json: { lsn: 1 } }, { json: { lsn: 2 } }, { json: { lsn: 3 } }, { json: { lsn: 4 } }], { tokens });
+  await Promise.all([kv.database('notes-1').put('a', '1'), kv.database('notes-1').put('b', '2')]);
+  await kv.database('notes-1').put('c', '3');
+  await kv.database('notes-2').put('a', '1');
+  assert.deepEqual([...issued.keys()], ['notes-1', 'notes-2']);
+  assert.equal(seen[0]!.headers.authorization, `Bearer ${issued.get('notes-1')}`);
+  assert.equal(seen[2]!.headers.authorization, `Bearer ${issued.get('notes-1')}`);
+  assert.equal(seen[3]!.headers.authorization, `Bearer ${issued.get('notes-2')}`);
+});
+
+test('a refused token is replaced and the request tried once more', async () => {
+  const issued: string[] = [];
+  const tokens: TokenSource = () => {
+    issued.push(jwt(3600, `t${issued.length}`));
+    return issued[issued.length - 1]!;
+  };
+  const { kv, seen } = client(
+    [failure(401, 'TOKEN_EXPIRED'), { json: { lsn: 1 } }, failure(401, 'UNAUTHENTICATED'), failure(401, 'UNAUTHENTICATED')],
+    { tokens },
+  );
+  const db = kv.database('notes');
+  assert.deepEqual(await db.put('a', '1'), { lsn: 1 });
+  assert.equal(seen[0]!.headers.authorization, `Bearer ${issued[0]}`);
+  assert.equal(seen[1]!.headers.authorization, `Bearer ${issued[1]}`);
+  // Refused again straight after a new token: reported, not retried forever.
+  await assert.rejects(db.put('b', '2'), { code: 'UNAUTHENTICATED' });
+  assert.equal(seen.length, 4);
+});
+
+test('a token close to expiry is renewed before it is used', async () => {
+  const issued: string[] = [];
+  const tokens: TokenSource = () => {
+    // The first is already past its renewal time when it arrives.
+    issued.push(jwt(issued.length === 0 ? -1 : 3600, `t${issued.length}`));
+    return issued[issued.length - 1]!;
+  };
+  const { kv, seen } = client([{ json: { lsn: 1 } }, { json: { lsn: 2 } }], { tokens });
+  await kv.database('notes').put('a', '1');
+  await kv.database('notes').put('b', '2');
+  assert.equal(issued.length, 2);
+  assert.equal(seen[1]!.headers.authorization, `Bearer ${issued[1]}`);
+});
+
+test('a failing token source is reported as UNAVAILABLE', async () => {
+  const { kv, seen } = client([], { tokens: async () => Promise.reject(new Error('backend down')) });
+  await assert.rejects(kv.database('notes').get('a'), (error: EdgeKVError) => {
+    assert.equal(error.code, 'UNAVAILABLE');
+    assert.match(error.message, /backend down/);
+    return true;
+  });
+  assert.equal(seen.length, 0);
+});
+
+test('tokenRefreshAt renews a minute early, or halfway for a short token, and never for a token without exp', () => {
+  const now = 1_000_000_000_000;
+  const at = (exp: number) => `x.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.y`;
+  assert.equal(tokenRefreshAt(at(now / 1000 + 3600), now), now + 3_540_000);
+  assert.equal(tokenRefreshAt(at(now / 1000 + 60), now), now + 30_000);
+  assert.equal(tokenRefreshAt('ekv_not_a_jwt', now), Infinity);
+});
+
+test('createToken asks the service for a token for one database', async () => {
+  const { kv, seen } = client([{ status: 201, json: { token: 'eyJ.x.y', scope: 'write', expires_at: '2026-10-15T13:00:00Z' } }]);
+  const token = await kv.database('notes-user-1').createToken({ scope: 'write', ttlSeconds: 600, subject: 'user-1' });
+  assert.deepEqual(token, { token: 'eyJ.x.y', scope: 'write', expiresAt: '2026-10-15T13:00:00Z' });
+  assert.equal(seen[0]!.url.pathname, '/v1/db/notes-user-1/tokens');
+  assert.deepEqual(JSON.parse(seen[0]!.body as string), { scope: 'write', ttl_seconds: 600, subject: 'user-1' });
+});
+
+test('an API key or tokens, never both, and tokens cannot manage databases', async () => {
+  const tokens = () => 'eyJ.x.y';
+  assert.throws(() => new EdgeKV({ url: 'https://api.test' }), { code: 'BAD_REQUEST' });
+  assert.throws(() => new EdgeKV({ apiKey: 'ekv_k', tokens, url: 'https://api.test' }), { code: 'BAD_REQUEST' });
+  const { kv, seen } = client([], { tokens, controlUrl: 'https://cp.test' });
+  await assert.rejects(kv.regions(), /API key/);
+  assert.equal(seen.length, 0);
 });

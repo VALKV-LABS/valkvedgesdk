@@ -147,6 +147,53 @@ class IntegrationTests(unittest.TestCase):
         self.assertFalse(waiter.is_alive(), "woken by the write, not by the timeout")
         self.assertEqual(woke[0].lsn, written)
 
+    def test_a_write_with_a_stale_version_is_refused_and_update_loses_no_increments(self):
+        db = self.db
+        db.put("cas/stock", "10")
+        read = db.get_versioned("cas/stock")
+        self.assertEqual(read.value, b"10")
+        self.assertTrue(read.version)
+        db.put("cas/stock", "9", if_version=read.version)
+        with self.assertRaises(EdgeKVError) as caught:
+            db.put("cas/stock", "8", if_version=read.version)
+        self.assertEqual((caught.exception.code, caught.exception.status), ("CONDITION_FAILED", 412))
+        self.assertEqual(caught.exception.key, b"cas/stock")
+        self.assertFails("CONDITION_FAILED", lambda: db.put("cas/stock", "x", if_absent=True))
+        self.assertEqual(db.get_text("cas/stock"), "9")
+        db.commit([{"op": "put", "key": "cas/new", "value": "1"}], conditions=[{"key": "cas/new", "version": None}])
+
+        def increment(current):
+            return str(int(current or b"0") + 1)
+
+        workers = [threading.Thread(target=db.update, args=("cas/counter", increment)) for _ in range(5)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=30)
+        self.assertEqual(db.get_text("cas/counter"), "5")
+
+    def test_an_app_with_tokens_from_the_backend_reads_and_writes_one_database_and_no_more(self):
+        minted = []
+
+        def tokens(database):
+            # The backend: holds the API key and mints a token per database.
+            minted.append(database)
+            return self.kv.database(database).create_token(scope="write", ttl_seconds=300, subject="sdk-test").token
+
+        app = EdgeKV(url=env("EDGEKV_URL"), tokens=tokens)
+        app.database(self.name).put("token/a", "from the app")
+        self.assertEqual(app.database(self.name).get_text("token/a"), "from the app")
+        self.assertEqual(minted, [self.name])
+
+        read = self.kv.database(self.name).create_token()
+        self.assertEqual(read.scope, "read")
+        reader = EdgeKV(url=env("EDGEKV_URL"), tokens=lambda database: read.token)
+        self.assertEqual(reader.database(self.name).get_text("token/a"), "from the app")
+        self.assertFails("FORBIDDEN", lambda: reader.database(self.name).put("token/a", "no"), 403)
+        with self.assertRaises(EdgeKVError) as caught:
+            reader.database(self.name).create_token()
+        self.assertEqual(caught.exception.status, 403)
+
     def test_a_database_that_does_not_exist_and_a_wrong_key_are_told_apart(self):
         self.assertFails("NOT_FOUND", lambda: self.kv.database("no-such-database").get("k"), 404)
         stranger = EdgeKV("ekv_this-key-was-never-issued-000000", env("EDGEKV_URL"), env("EDGEKV_CONTROL_URL"))

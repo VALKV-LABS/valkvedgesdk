@@ -1,8 +1,9 @@
 /**
  * ValkvEdgeKV client for TypeScript and JavaScript.
  *
- * `EdgeKV` talks to the service over HTTPS with an API key. It keeps no local
- * copy: every read and write is a request. It needs a runtime with `fetch`:
+ * `EdgeKV` talks to the service over HTTPS with an API key, or with access
+ * tokens your backend mints. It keeps no local copy: every read and write is
+ * a request. It needs a runtime with `fetch`:
  * Node 18 or later, Deno, Bun, or a browser.
  *
  * `LocalEdgeKV` keeps a copy on this machine, read without the network and
@@ -13,9 +14,22 @@
 /** A value to store: bytes, or text, which is stored as UTF-8. */
 export type Value = Uint8Array | string;
 
+/**
+ * Gets an access token for one database, usually by asking your backend,
+ * which mints it with `Database.createToken`. Called the first time a
+ * database is used, again about a minute before the token expires, and
+ * whenever the service refuses it.
+ */
+export type TokenSource = (database: string) => Promise<string> | string;
+
 export interface EdgeKVOptions {
-  /** An API key from the portal: `ekv_…`. */
-  apiKey: string;
+  /** An API key from the portal: `ekv_…`. For your servers. Give this or `tokens`. */
+  apiKey?: string;
+  /**
+   * For apps on your users' devices, which must not hold an API key: where
+   * to get a token for each database. Give this or `apiKey`.
+   */
+  tokens?: TokenSource;
   /** Where the data API is, for example `https://api.example.com`. */
   url: string;
   /**
@@ -51,6 +65,8 @@ export class EdgeKVError extends Error {
     message: string,
     /** The HTTP status, or 0 when no response arrived. */
     readonly status: number,
+    /** For `CONDITION_FAILED`: the key whose condition did not hold, when known. */
+    readonly key?: Uint8Array,
   ) {
     super(message);
     this.name = 'EdgeKVError';
@@ -65,6 +81,19 @@ export class EdgeKVError extends Error {
 export interface WriteResult {
   /** Position of this write in the database's log. Later writes have higher numbers. */
   lsn: number;
+  /** The version the key's new value has. Present for a put. */
+  version?: string;
+}
+
+export interface CommitResult extends WriteResult {
+  /** The version each operation gave its key, in order. */
+  versions: string[];
+}
+
+/** A value and its version: pass the version back to write only if the value has not changed since. */
+export interface Versioned {
+  value: Uint8Array;
+  version: string;
 }
 
 export interface Entry {
@@ -72,9 +101,50 @@ export interface Entry {
   /** The key as stored, for keys that are not valid UTF-8 text. */
   keyBytes: Uint8Array;
   value: Uint8Array;
+  /** The value's version, when the source reports it. */
+  version?: string;
 }
 
 export type Operation = { op: 'put'; key: Value; value: Value } | { op: 'delete'; key: Value };
+
+/** A requirement for a commit: `key` is still at `version`, or has no value when `version` is `null`. */
+export interface Condition {
+  key: Value;
+  version: string | null;
+}
+
+/** Makes a single-key write conditional. Give at most one. */
+export interface WriteCondition {
+  /** Only if the key is still at this version. */
+  ifVersion?: string;
+  /** Only if the key has no value: create, never overwrite. */
+  ifAbsent?: boolean;
+}
+
+/**
+ * Computes a key's new value from its current one (`null` when it has none).
+ * Return `null` to delete the key. It may run more than once.
+ */
+export type Change = (current: Uint8Array | null) => Value | null | Promise<Value | null>;
+
+/** How many times `update` reads and tries again before giving up with `CONDITION_FAILED`. */
+export const UPDATE_ATTEMPTS = 16;
+
+export interface TokenOptions {
+  /** `'read'` (the default) or `'write'`. A read-only key can mint only read tokens. */
+  scope?: 'read' | 'write';
+  /** How long the token works: 60 to 86 400 seconds. Default 3600. */
+  ttlSeconds?: number;
+  /** Your own name for the user, kept in the token. */
+  subject?: string;
+}
+
+export interface Token {
+  /** Send it as a key: `Authorization: Bearer <token>`, or give it to an app's `tokens` source. */
+  token: string;
+  scope: 'read' | 'write';
+  expiresAt: string;
+}
 
 export interface ScanOptions {
   /** Only keys that start with this. */
@@ -138,39 +208,132 @@ function keyPath(key: string): string {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+function conditionHeaders(condition: WriteCondition): Record<string, string> {
+  if (condition.ifVersion !== undefined && condition.ifAbsent) {
+    throw new EdgeKVError('BAD_REQUEST', 'give ifVersion or ifAbsent, not both', 0);
+  }
+  if (condition.ifVersion !== undefined) return { 'if-match': condition.ifVersion };
+  return condition.ifAbsent ? { 'if-none-match': '*' } : {};
+}
+
 interface RequestOptions {
   body?: BodyInit;
   json?: unknown;
   query?: Record<string, string | number | undefined>;
+  headers?: Record<string, string>;
   timeoutMs?: number;
 }
 
-/** Sends requests to one base URL: adds the key, the timeout and the retries, and turns failures into `EdgeKVError`. */
+/** What requests are sent with: a fixed API key, or one database's access token. */
+interface Credential {
+  get(): Promise<string>;
+  /** The service refused `token`. Returns true if a new one may be fetched and the request tried again. */
+  refuse(token: string): boolean;
+}
+
+const apiKeyCredential = (apiKey: string): Credential => ({ get: async () => apiKey, refuse: () => false });
+
+/**
+ * When to stop using a token: a minute before its `exp`, or halfway through
+ * its life if that is sooner. A token that does not say is used until refused.
+ */
+export function tokenRefreshAt(token: string, now = Date.now()): number {
+  try {
+    const part = token.split('.')[1]!.replace(/-/g, '+').replace(/_/g, '/');
+    const exp = (JSON.parse(atob(part.padEnd(part.length + ((4 - (part.length % 4)) % 4), '='))) as { exp?: unknown }).exp;
+    if (typeof exp !== 'number') return Infinity;
+    const expiresAt = exp * 1000;
+    return Math.max(expiresAt - 60_000, now + (expiresAt - now) / 2);
+  } catch {
+    return Infinity;
+  }
+}
+
+/** One database's access token, fetched from the application's source and kept until it is due for renewal. */
+class TokenCredential implements Credential {
+  private current?: { token: string; refreshAt: number };
+  private pending?: Promise<string>;
+
+  constructor(
+    private readonly source: TokenSource,
+    private readonly database: string,
+  ) {}
+
+  get(): Promise<string> {
+    if (this.current && Date.now() < this.current.refreshAt) return Promise.resolve(this.current.token);
+    this.pending ??= this.fetch().finally(() => {
+      this.pending = undefined;
+    });
+    return this.pending;
+  }
+
+  refuse(token: string): boolean {
+    if (this.current?.token === token) this.current = undefined;
+    return true;
+  }
+
+  private async fetch(): Promise<string> {
+    let token: unknown;
+    try {
+      token = await this.source(this.database);
+    } catch (error) {
+      if (error instanceof EdgeKVError) throw error;
+      // Retryable, like a service that is briefly unavailable.
+      throw new EdgeKVError('UNAVAILABLE', `the token source failed: ${error instanceof Error ? error.message : error}`, 0);
+    }
+    if (typeof token !== 'string' || token.length === 0) {
+      throw new EdgeKVError('BAD_REQUEST', `the token source returned no token for ${this.database}`, 0);
+    }
+    this.current = { token, refreshAt: tokenRefreshAt(token) };
+    return token;
+  }
+}
+
+/** Codes that mean the credential itself was refused. */
+const REFUSED = ['TOKEN_EXPIRED', 'UNAUTHENTICATED'];
+
+/** Sends requests to one base URL: adds the credential, the timeout and the retries, and turns failures into `EdgeKVError`. */
 class Transport {
   constructor(
     private readonly base: string,
-    private readonly apiKey: string,
+    private readonly credential: Credential,
     private readonly timeoutMs: number,
     private readonly retries: number,
     private readonly fetchImpl: typeof fetch,
   ) {}
+
+  /** The same service, with another credential. */
+  with(credential: Credential): Transport {
+    return new Transport(this.base, credential, this.timeoutMs, this.retries, this.fetchImpl);
+  }
 
   async send(method: string, path: string, options: RequestOptions = {}): Promise<Response> {
     const url = new URL(this.base.replace(/\/+$/, '') + path);
     for (const [name, value] of Object.entries(options.query ?? {})) {
       if (value !== undefined) url.searchParams.set(name, String(value));
     }
-    const headers: Record<string, string> = { authorization: `Bearer ${this.apiKey}` };
+    const headers: Record<string, string> = { ...options.headers };
     let body = options.body;
     if (options.json !== undefined) {
       headers['content-type'] = 'application/json';
       body = JSON.stringify(options.json);
     }
+    let renewed = false;
     for (let attempt = 0; ; attempt += 1) {
+      let token: string | undefined;
       try {
-        return await this.once(method, url, headers, body, options.timeoutMs ?? this.timeoutMs);
+        token = await this.credential.get();
+        const sent = { ...headers, authorization: `Bearer ${token}` };
+        return await this.once(method, url, sent, body, options.timeoutMs ?? this.timeoutMs);
       } catch (error) {
-        if (!(error instanceof EdgeKVError) || !error.retryable || attempt >= this.retries) throw error;
+        if (!(error instanceof EdgeKVError)) throw error;
+        // A refused token is renewed and the request tried once more, at once.
+        if (REFUSED.includes(error.code) && token !== undefined && !renewed && this.credential.refuse(token)) {
+          renewed = true;
+          attempt -= 1;
+          continue;
+        }
+        if (!error.retryable || attempt >= this.retries) throw error;
         // 100 ms, 200 ms, 400 ms, …, with jitter so many clients do not retry together.
         await sleep(100 * 2 ** attempt * (0.5 + Math.random()));
       }
@@ -198,14 +361,16 @@ class Transport {
     if (response.ok) return response;
     let code = response.headers.get('x-edgekv-error') ?? '';
     let message = '';
+    let key: Uint8Array | undefined;
     try {
-      const parsed = (await response.json()) as { error?: { code?: string; message?: string } };
+      const parsed = (await response.json()) as { error?: { code?: string; message?: string; key?: string } };
       code = parsed.error?.code ?? code;
       message = parsed.error?.message ?? '';
+      if (typeof parsed.error?.key === 'string') key = fromBase64(parsed.error.key);
     } catch {
       // Not the service's error shape: a gateway or proxy answered.
     }
-    throw new EdgeKVError(code || 'SERVICE_ERROR', message || `the service answered ${response.status}`, response.status);
+    throw new EdgeKVError(code || 'SERVICE_ERROR', message || `the service answered ${response.status}`, response.status, key);
   }
 }
 
@@ -224,9 +389,14 @@ export class Database {
 
   /** The value stored under `key`, or `null` if there is none. */
   async get(key: string): Promise<Uint8Array | null> {
+    return (await this.getVersioned(key))?.value ?? null;
+  }
+
+  /** The value stored under `key` and its version, or `null` if there is none. */
+  async getVersioned(key: string): Promise<Versioned | null> {
     try {
       const response = await this.transport.send('GET', this.path(`/kv/${keyPath(key)}`));
-      return new Uint8Array(await response.arrayBuffer());
+      return { value: new Uint8Array(await response.arrayBuffer()), version: response.headers.get('x-edgekv-version') ?? '' };
     } catch (error) {
       if (error instanceof EdgeKVError && error.code === 'KEY_NOT_FOUND') return null;
       throw error;
@@ -245,36 +415,84 @@ export class Database {
     return text === null ? null : (JSON.parse(text) as T);
   }
 
-  /** Stores a value. Returns once the service has made it durable. */
-  async put(key: string, value: Value): Promise<WriteResult> {
-    const response = await this.transport.send('PUT', this.path(`/kv/${keyPath(key)}`), { body: toBytes(value) as BodyInit });
+  /**
+   * Stores a value. Returns once the service has made it durable. With a
+   * condition that does not hold, writes nothing and fails with
+   * `CONDITION_FAILED`.
+   */
+  async put(key: string, value: Value, condition: WriteCondition = {}): Promise<WriteResult> {
+    const response = await this.transport.send('PUT', this.path(`/kv/${keyPath(key)}`), {
+      body: toBytes(value) as BodyInit,
+      headers: conditionHeaders(condition),
+    });
     return (await response.json()) as WriteResult;
   }
 
   /** Stores a value as JSON text. */
-  putJson(key: string, value: unknown): Promise<WriteResult> {
-    return this.put(key, JSON.stringify(value));
+  putJson(key: string, value: unknown, condition: WriteCondition = {}): Promise<WriteResult> {
+    return this.put(key, JSON.stringify(value), condition);
   }
 
-  /** Removes a key. Removing a key that is not there is not an error. */
-  async delete(key: string): Promise<WriteResult> {
-    const response = await this.transport.send('DELETE', this.path(`/kv/${keyPath(key)}`));
+  /** Removes a key. Removing a key that is not there is not an error, unless `ifVersion` is given. */
+  async delete(key: string, condition: Pick<WriteCondition, 'ifVersion'> = {}): Promise<WriteResult> {
+    const response = await this.transport.send('DELETE', this.path(`/kv/${keyPath(key)}`), {
+      headers: conditionHeaders(condition),
+    });
     return (await response.json()) as WriteResult;
   }
 
   /**
    * Several puts and deletes as one write: all of them happen or none does.
    * Keys here may be bytes, so this also reaches keys that are not text.
+   * With `conditions`, only if every one holds; otherwise nothing is written
+   * and it fails with `CONDITION_FAILED`, naming the key in `error.key`.
    */
-  async commit(operations: Operation[]): Promise<WriteResult> {
+  async commit(operations: Operation[], options: { conditions?: Condition[] } = {}): Promise<CommitResult> {
     if (operations.length === 0) throw new EdgeKVError('BAD_REQUEST', 'a commit needs at least one operation', 0);
     const ops = operations.map((operation) =>
       operation.op === 'put'
         ? { op: 'put', key: toBase64(toBytes(operation.key)), value: toBase64(toBytes(operation.value)) }
         : { op: 'delete', key: toBase64(toBytes(operation.key)) },
     );
-    const response = await this.transport.send('POST', this.path('/commit'), { json: { ops } });
-    return (await response.json()) as WriteResult;
+    const conditions = options.conditions?.map((c) => ({ key: toBase64(toBytes(c.key)), version: c.version }));
+    const response = await this.transport.send('POST', this.path('/commit'), {
+      json: conditions?.length ? { ops, conditions } : { ops },
+    });
+    return (await response.json()) as CommitResult;
+  }
+
+  /**
+   * Reads a key, computes its new value with `change`, and writes it back if
+   * nobody else wrote the key in between, reading and trying again if they
+   * did. Use it for counters, stock levels and anything else a plain put
+   * would lose updates to. Returns `null` when nothing was written (there was
+   * no value and `change` returned `null`).
+   */
+  async update(key: string, change: Change): Promise<WriteResult | null> {
+    for (let attempt = 0; attempt < UPDATE_ATTEMPTS; attempt += 1) {
+      const current = await this.getVersioned(key);
+      const next = await change(current?.value ?? null);
+      try {
+        if (next !== null) return await this.put(key, next, current ? { ifVersion: current.version } : { ifAbsent: true });
+        if (current === null) return null;
+        return await this.delete(key, { ifVersion: current.version });
+      } catch (error) {
+        if (!(error instanceof EdgeKVError) || error.code !== 'CONDITION_FAILED') throw error;
+      }
+    }
+    throw new EdgeKVError('CONDITION_FAILED', `${key} kept changing: gave up after ${UPDATE_ATTEMPTS} attempts`, 412, toBytes(key));
+  }
+
+  /**
+   * Mints an access token for this database, to give to an app on a user's
+   * device instead of an API key. Call it on your backend, with an API key.
+   */
+  async createToken(options: TokenOptions = {}): Promise<Token> {
+    const response = await this.transport.send('POST', this.path('/tokens'), {
+      json: { scope: options.scope, ttl_seconds: options.ttlSeconds, subject: options.subject },
+    });
+    const body = (await response.json()) as { token: string; scope: Token['scope']; expires_at: string };
+    return { token: body.token, scope: body.scope, expiresAt: body.expires_at };
   }
 
   /** One page of entries in key order. Most callers want `scan`. */
@@ -282,11 +500,16 @@ export class Database {
     const response = await this.transport.send('GET', this.path('/kv'), {
       query: { prefix: options.prefix, limit: options.pageSize, page_token: options.pageToken },
     });
-    const page = (await response.json()) as { items: { key: string; value: string }[]; next_page_token: string | null };
+    const page = (await response.json()) as {
+      items: { key: string; value: string; version?: string }[];
+      next_page_token: string | null;
+    };
     return {
       items: page.items.map((item) => {
         const keyBytes = fromBase64(item.key);
-        return { key: decoder.decode(keyBytes), keyBytes, value: fromBase64(item.value) };
+        const entry: Entry = { key: decoder.decode(keyBytes), keyBytes, value: fromBase64(item.value) };
+        if (item.version !== undefined) entry.version = item.version;
+        return entry;
       }),
       nextPageToken: page.next_page_token,
     };
@@ -412,22 +635,38 @@ export class EdgeKV {
   /** Creating, listing and deleting databases. Needs `controlUrl` and a key that may manage databases. */
   readonly databases: Databases;
 
+  private readonly tokens?: TokenSource;
+  /** Each database's token, shared by every `Database` for it. */
+  private readonly credentials = new Map<string, TokenCredential>();
+
   constructor(options: EdgeKVOptions) {
-    if (!options.apiKey?.startsWith('ekv_')) {
+    if ((options.apiKey === undefined) === (options.tokens === undefined)) {
+      throw new EdgeKVError('BAD_REQUEST', 'give apiKey (on a server) or tokens (in an app), not both and not neither', 0);
+    }
+    if (options.apiKey !== undefined && !options.apiKey.startsWith('ekv_')) {
       throw new EdgeKVError('BAD_REQUEST', 'apiKey must be an API key from the portal: ekv_…', 0);
+    }
+    if (options.tokens !== undefined && typeof options.tokens !== 'function') {
+      throw new EdgeKVError('BAD_REQUEST', 'tokens must be a function that returns a token for a database name', 0);
     }
     if (!options.url) throw new EdgeKVError('BAD_REQUEST', 'url is required: where the data API is', 0);
     const fetchImpl = options.fetch ?? globalThis.fetch;
     if (!fetchImpl) throw new EdgeKVError('BAD_REQUEST', 'this runtime has no fetch; pass one in options.fetch', 0);
     const timeoutMs = options.timeoutMs ?? 15_000;
     const retries = options.retries ?? 3;
-    const make = (base: string) => new Transport(base, options.apiKey, timeoutMs, retries, fetchImpl.bind(globalThis));
+    // With tokens there is no account-wide credential: `database` gives each its own.
+    const credential = apiKeyCredential(options.apiKey ?? '');
+    const make = (base: string) => new Transport(base, credential, timeoutMs, retries, fetchImpl.bind(globalThis));
+    this.tokens = options.tokens;
     this.data = make(options.url);
-    this.control = options.controlUrl ? make(options.controlUrl) : undefined;
+    this.control = options.controlUrl && options.apiKey !== undefined ? make(options.controlUrl) : undefined;
     this.databases = new Databases(() => this.requireControl());
   }
 
   private requireControl(): Transport {
+    if (this.tokens) {
+      throw new EdgeKVError('BAD_REQUEST', 'managing databases needs an API key; an access token works for one database only', 0);
+    }
     if (!this.control) {
       throw new EdgeKVError('BAD_REQUEST', 'managing databases needs controlUrl in the options', 0);
     }
@@ -436,7 +675,13 @@ export class EdgeKV {
 
   /** A database by name. Makes no request: a wrong name shows up as `NOT_FOUND` on first use. */
   database(name: string): Database {
-    return new Database(this.data, name);
+    if (!this.tokens) return new Database(this.data, name);
+    let credential = this.credentials.get(name);
+    if (!credential) {
+      credential = new TokenCredential(this.tokens, name);
+      this.credentials.set(name, credential);
+    }
+    return new Database(this.data.with(credential), name);
   }
 
   /** Regions a database can be created in. */
@@ -446,6 +691,15 @@ export class EdgeKV {
   }
 }
 
-export { LocalEdgeKV, LocalDatabase } from './local.js';
-export type { Durability, LocalOptions, LocalDatabaseOptions, LocalWriteResult, LocalScanOptions, LocalStatus, WriteEvent } from './local.js';
+export { LocalEdgeKV, LocalDatabase, LocalWatch } from './local.js';
+export type {
+  ChangeEvent,
+  Durability,
+  LocalOptions,
+  LocalDatabaseOptions,
+  LocalWriteResult,
+  LocalScanOptions,
+  LocalStatus,
+  WriteEvent,
+} from './local.js';
 export { PLATFORMS } from './native.js';

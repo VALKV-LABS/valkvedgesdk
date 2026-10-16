@@ -14,7 +14,16 @@ import { EdgeKVError } from './index.js';
 
 /** What the native library exposes. Its source is `native/src/lib.rs`. */
 export interface NativeBinding {
-  openKv(options: { path: string; url?: string; apiKey?: string; maxOpenDatabases?: number }): Promise<NativeKv>;
+  openKv(options: NativeOpenOptions): Promise<NativeKv>;
+  /** `tokens` is called with a database name and must return a promise. */
+  openKvWithTokens(options: NativeOpenOptions, tokens: (database: string) => Promise<string>): NativeKv;
+}
+
+export interface NativeOpenOptions {
+  path: string;
+  url?: string;
+  apiKey?: string;
+  maxOpenDatabases?: number;
 }
 
 export interface NativeKv {
@@ -25,12 +34,24 @@ export interface NativeKv {
 export interface NativeDb {
   readonly name: string;
   get(key: Buffer): Buffer | null;
+  getVersioned(key: Buffer): { value: Buffer; version: string } | null;
+  watch(prefix: Buffer): NativeWatch;
   scan(bounds: { prefix?: Buffer; start?: Buffer; end?: Buffer; after?: Buffer; limit?: number }): { key: Buffer; value: Buffer }[];
-  commit(ops: { delete: boolean; key: Buffer; value?: Buffer }[], durability?: string): Promise<{ lsn?: number | null; outboxSeq?: number | null }>;
+  commit(
+    ops: { delete: boolean; key: Buffer; value?: Buffer }[],
+    durability?: string,
+    conditions?: { key: Buffer; version?: string }[],
+  ): Promise<{ lsn?: number | null; outboxSeq?: number | null; versions: string[] }>;
   sync(): Promise<number>;
   flush(): Promise<number>;
   status(): { appliedLsn: number; generation: number; outboxEntries: number; outboxBytes: number; diskBytes: number };
   takeEvents(): { outboxSeq: number; key: Buffer; outcome: string }[];
+}
+
+export interface NativeWatch {
+  /** The next change, or `null` once closed. */
+  next(): Promise<{ reset: boolean; key?: Buffer | null; value?: Buffer | null } | null>;
+  close(): void;
 }
 
 /** The platforms a native library is published for, by package suffix. */
