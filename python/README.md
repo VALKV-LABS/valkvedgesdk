@@ -4,8 +4,9 @@ A client for ValkvEdgeKV. It talks to the service over HTTPS with an API key; it
 no local copy, so every read and write is a request. For a local replica that works
 offline, use the Rust library.
 
-Python 3.9 or later. No dependencies: it uses only the standard library. Calls block;
-use a thread, or `asyncio.to_thread`, to run them alongside other work.
+Python 3.9 or later. No dependencies: it uses only the standard library, and the
+`cryptography` package if you encrypt values (`pip install "valkv-edgekv[encryption]"`).
+Calls block; use a thread, or `asyncio.to_thread`, to run them alongside other work.
 
 **Not published to PyPI yet.** Install it from this folder: `pip install ./python`.
 
@@ -76,6 +77,31 @@ for entry in db.scan(prefix="order/"):
 
 Entries come back in key order, fetched a page at a time as the loop runs. `scan_page`
 gives you one page and a token for the next, if you would rather drive it yourself.
+
+### Encrypting values
+
+```python
+# 32 bytes, or 64 hexadecimal characters (openssl rand -hex 32). Keep it safe: it cannot be recovered.
+vault = kv.database("vault", encryption_key=os.environ["VAULT_KEY"])
+
+vault.put_json("patient/7", {"diagnosis": "asthma"})   # the service receives ciphertext
+record = vault.get_json("patient/7")                   # decrypted here
+```
+
+With `encryption_key`, values are encrypted in this process with ChaCha20-Poly1305
+before they are sent, and decrypted when read: `get`, `scan`, `put`, `commit` and
+`update` all work as before, and the service only ever stores ciphertext. Without it,
+values are sent as they are. Key names, value sizes and timestamps are not encrypted, so
+keep secrets out of key names. Each value grows by `ENCRYPTION_OVERHEAD` (28 bytes).
+Needs `pip install "valkv-edgekv[encryption]"`.
+
+The format is the one local replicas use (the Rust library, and the TypeScript
+package's local mode): a replica opened with the same key reads these values, and this
+reads theirs.
+
+Choose per database, not per write: a database is either encrypted, always with the
+same key, or not at all. Reading a value written without the key, or with another key,
+raises `INVALID_ENCRYPTION_KEY`.
 
 ### Waiting for changes
 

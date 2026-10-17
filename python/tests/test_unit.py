@@ -432,5 +432,123 @@ def jwt(seconds, token_id="a"):
     return f"{part({'alg': 'HS256'})}.{part({'exp': int(time.time()) + seconds, 'jti': token_id})}.sig"
 
 
+try:
+    import cryptography  # noqa: F401
+
+    HAVE_CRYPTOGRAPHY = True
+except ImportError:
+    HAVE_CRYPTOGRAPHY = False
+
+KEY = bytes(range(32))
+OTHER_KEY = bytes([9]) * 32
+
+#: The format shared with the valkvedge library and the TypeScript client: the
+#: same vector is checked in each of them.
+VECTOR = {
+    "database": "agent-memory",
+    "key": b"facts/name",
+    "value": b"Ada Lovelace",
+    "nonce": bytes(range(0xA0, 0xAC)),
+    "sealed": bytes.fromhex("a0a1a2a3a4a5a6a7a8a9aaab4dcf197f0189b4c8cc6e9071b3f75750df0d5894317f0dd9e2ece8f5"),
+}
+
+
+@unittest.skipUnless(HAVE_CRYPTOGRAPHY, 'needs pip install "valkv-edgekv[encryption]"')
+class EncryptionTests(unittest.TestCase):
+    def fails(self, code, status=None):
+        return ErrorCode(self, code, status)
+
+    def test_values_are_sealed_in_the_library_format_bound_to_their_database_and_key(self):
+        from edgekv._crypto import ValueCipher
+
+        cipher = ValueCipher(KEY, VECTOR["database"])
+        sealed = cipher.seal(VECTOR["key"], VECTOR["value"], VECTOR["nonce"])
+        self.assertEqual(sealed, VECTOR["sealed"])
+        self.assertEqual(len(sealed), len(VECTOR["value"]) + edgekv.ENCRYPTION_OVERHEAD)
+        self.assertEqual(cipher.open(VECTOR["key"], sealed), VECTOR["value"])
+
+        self.assertIsNone(cipher.open(b"facts/other", sealed), "moved to another key")
+        self.assertIsNone(ValueCipher(KEY, "other-db").open(VECTOR["key"], sealed), "moved to another database")
+        self.assertIsNone(ValueCipher(OTHER_KEY, VECTOR["database"]).open(VECTOR["key"], sealed), "another key")
+        self.assertIsNone(cipher.open(VECTOR["key"], sealed[:-1] + bytes([sealed[-1] ^ 1])), "tampered")
+        self.assertIsNone(cipher.open(VECTOR["key"], b"short"), "too short to be sealed")
+        self.assertNotEqual(cipher.seal(b"k", b"v"), cipher.seal(b"k", b"v"))
+
+    def test_an_encryption_key_is_32_bytes_or_64_hexadecimal_characters(self):
+        kv, _ = client([])
+        self.assertTrue(kv.database("a", encryption_key=KEY.hex()).encrypted)
+        self.assertTrue(kv.database("a", encryption_key=KEY.hex().upper()).encrypted)
+        self.assertFalse(kv.database("a").encrypted)
+        for wrong in (bytes(16), "abc", KEY.hex()[2:], KEY.hex()[2:] + "zz"):
+            with self.fails("BAD_REQUEST"):
+                kv.database("a", encryption_key=wrong)
+
+    def test_with_a_key_put_sends_ciphertext_and_get_returns_the_value(self):
+        kv, seen = client([ok({"lsn": 1})])
+        kv.database(VECTOR["database"], encryption_key=KEY).put("facts/name", "Ada Lovelace")
+        sent = seen[0]["body"]
+        self.assertEqual(len(sent), len(VECTOR["value"]) + edgekv.ENCRYPTION_OVERHEAD)
+        self.assertNotIn(VECTOR["value"], sent)
+
+        reader, _ = client([(200, {}, sent), (200, {}, VECTOR["sealed"])])
+        same = reader.database(VECTOR["database"], encryption_key=KEY.hex())
+        self.assertEqual(same.get_text("facts/name"), "Ada Lovelace")
+        self.assertEqual(same.get_text("facts/name"), "Ada Lovelace", "a value sealed by another client opens")
+
+    def test_the_wrong_key_or_a_value_that_was_not_encrypted_fails_with_invalid_encryption_key(self):
+        kv, _ = client([(200, {}, VECTOR["sealed"]), (200, {}, b"plain text"), (200, {}, VECTOR["sealed"])])
+        with self.fails("INVALID_ENCRYPTION_KEY") as failed:
+            kv.database(VECTOR["database"], encryption_key=OTHER_KEY).get("facts/name")
+        self.assertEqual(failed.error.key, b"facts/name")
+        with self.fails("INVALID_ENCRYPTION_KEY"):
+            kv.database(VECTOR["database"], encryption_key=KEY).get("facts/name")
+        # Without a key, the stored bytes come back as they are.
+        self.assertEqual(kv.database(VECTOR["database"]).get("facts/name"), VECTOR["sealed"])
+
+    def test_with_a_key_commits_seal_each_value_under_its_own_key_and_scans_open_them(self):
+        kv, seen = client([ok({"lsn": 2})])
+        kv.database("memory", encryption_key=KEY).commit(
+            [
+                {"op": "put", "key": "facts/a", "value": "one"},
+                {"op": "put", "key": "facts/b", "value": "two"},
+                {"op": "delete", "key": "facts/c"},
+            ]
+        )
+        ops = json.loads(seen[0]["body"])["ops"]
+        self.assertEqual(ops[2], {"op": "delete", "key": b64("facts/c")})
+        items = [
+            {"key": ops[0]["key"], "value": ops[0]["value"], "version": "v1"},
+            {"key": ops[1]["key"], "value": ops[1]["value"], "version": "v2"},
+        ]
+        moved = [{**items[0], "key": b64("facts/b")}]
+        reader, _ = client([ok({"items": items, "next_page_token": None}), ok({"items": moved, "next_page_token": None})])
+        db = reader.database("memory", encryption_key=KEY)
+        self.assertEqual(
+            [(e.key, e.value, e.version) for e in db.scan(prefix="facts/")],
+            [("facts/a", b"one", "v1"), ("facts/b", b"two", "v2")],
+        )
+        with self.fails("INVALID_ENCRYPTION_KEY"):
+            db.scan_page()
+
+    def test_update_reads_decrypts_and_writes_back_sealed_under_the_version_it_read(self):
+        from edgekv._crypto import ValueCipher
+
+        cipher = ValueCipher(KEY, "counters")
+        kv, seen = client([(200, {"x-edgekv-version": "v7"}, cipher.seal(b"hits", b"41")), ok({"lsn": 8})])
+        kv.database("counters", encryption_key=KEY).update("hits", lambda current: str(int(current) + 1))
+        self.assertEqual(seen[1]["headers"]["If-Match"], "v7")
+        self.assertEqual(cipher.open(b"hits", seen[1]["body"]), b"42")
+
+
+class WithoutCryptographyTests(unittest.TestCase):
+    @unittest.skipIf(HAVE_CRYPTOGRAPHY, "cryptography is installed")
+    def test_a_key_without_the_cryptography_package_says_what_to_install(self):
+        kv, _ = client([])
+        with self.assertRaises(EdgeKVError) as raised:
+            kv.database("a", encryption_key=KEY)
+        self.assertEqual(raised.exception.code, "BAD_REQUEST")
+        self.assertIn("valkv-edgekv[encryption]", str(raised.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

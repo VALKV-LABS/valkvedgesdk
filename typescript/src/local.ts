@@ -24,6 +24,7 @@ import {
   type Versioned,
   type WriteCondition,
 } from './index.js';
+import { encryptionKeyBytes } from './crypto.js';
 import { loadNative, type NativeDb, type NativeKv, type NativeWatch } from './native.js';
 
 /** `'sync'`: return once the write is stored durably. `'buffered'`: return once it is on local disk. */
@@ -51,11 +52,13 @@ export interface LocalDatabaseOptions {
   /** Used by writes that do not name one. Default `'sync'`, or `'buffered'` when ingesting. */
   durability?: Durability;
   /**
-   * 32 bytes. Values are encrypted with it on this machine, before they are
-   * written to disk or sent anywhere: the service only ever holds ciphertext.
-   * Keys (the names) are not encrypted. A lost key cannot be recovered.
+   * 32 bytes, or 64 hexadecimal characters. Values are encrypted with it on
+   * this machine, before they are written to disk or sent anywhere: the
+   * service only ever holds ciphertext. `EdgeKV.database(name, { encryptionKey })`
+   * reads and writes the same values remotely. Keys (the names) are not
+   * encrypted. A lost key cannot be recovered.
    */
-  encryptionKey?: Uint8Array;
+  encryptionKey?: Uint8Array | string;
   /**
    * Keep no copy of the database here: writes are buffered on disk,
    * uploaded in the background and removed once the service has them, and
@@ -191,9 +194,12 @@ export class LocalEdgeKV {
    * database that follows the service and has no local copy downloads one.
    */
   async database(name: string, options: LocalDatabaseOptions = {}): Promise<LocalDatabase> {
-    const { durability, encryptionKey, ingest = false } = options;
-    if (encryptionKey !== undefined && encryptionKey.byteLength !== 32) {
-      throw new EdgeKVError('BAD_REQUEST', `encryptionKey must be 32 bytes, not ${encryptionKey.byteLength}`, 0);
+    const { durability, ingest = false } = options;
+    let encryptionKey: Uint8Array | undefined;
+    try {
+      encryptionKey = options.encryptionKey === undefined ? undefined : encryptionKeyBytes(options.encryptionKey);
+    } catch (error) {
+      throw new EdgeKVError('BAD_REQUEST', (error as Error).message, 0);
     }
     const db = await callAsync(() =>
       this.native.database(name, { durability, encryptionKey: encryptionKey && buf(encryptionKey), ingest }),

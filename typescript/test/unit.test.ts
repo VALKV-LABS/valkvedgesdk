@@ -1,7 +1,8 @@
 // Tests of the client against a stand-in for `fetch`. No network.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { EdgeKV, EdgeKVError, UPDATE_ATTEMPTS, tokenRefreshAt, type TokenSource } from '../src/index.js';
+import { ValueCipher, encryptionKeyBytes } from '../src/crypto.js';
+import { ENCRYPTION_OVERHEAD, EdgeKV, EdgeKVError, UPDATE_ATTEMPTS, tokenRefreshAt, type TokenSource } from '../src/index.js';
 
 interface Seen {
   method: string;
@@ -392,4 +393,120 @@ test('an API key or tokens, never both, and tokens cannot manage databases', asy
   const { kv, seen } = client([], { tokens, controlUrl: 'https://cp.test' });
   await assert.rejects(kv.regions(), /API key/);
   assert.equal(seen.length, 0);
+});
+
+// --- Encryption -------------------------------------------------------------
+
+const KEY = Uint8Array.from({ length: 32 }, (_, i) => i);
+const KEY_HEX = Buffer.from(KEY).toString('hex');
+const OTHER_KEY = new Uint8Array(32).fill(9);
+const bytes = (text: string) => new TextEncoder().encode(text);
+
+/**
+ * The format shared with the valkvedge library and the Python client: the
+ * same vector is checked in each of them.
+ */
+const VECTOR = {
+  database: 'agent-memory',
+  key: 'facts/name',
+  value: 'Ada Lovelace',
+  nonce: Uint8Array.from({ length: 12 }, (_, i) => 0xa0 + i),
+  sealed: 'a0a1a2a3a4a5a6a7a8a9aaab4dcf197f0189b4c8cc6e9071b3f75750df0d5894317f0dd9e2ece8f5',
+};
+
+test('values are sealed in the library format, bound to their database and key', () => {
+  const cipher = new ValueCipher(KEY, VECTOR.database);
+  const sealed = cipher.seal(bytes(VECTOR.key), bytes(VECTOR.value), VECTOR.nonce);
+  assert.equal(Buffer.from(sealed).toString('hex'), VECTOR.sealed);
+  assert.equal(sealed.length, VECTOR.value.length + ENCRYPTION_OVERHEAD);
+  assert.deepEqual(cipher.open(bytes(VECTOR.key), sealed), bytes(VECTOR.value));
+
+  assert.equal(cipher.open(bytes('facts/other'), sealed), null, 'moved to another key');
+  assert.equal(new ValueCipher(KEY, 'other-db').open(bytes(VECTOR.key), sealed), null, 'moved to another database');
+  assert.equal(new ValueCipher(OTHER_KEY, VECTOR.database).open(bytes(VECTOR.key), sealed), null, 'another key');
+  const tampered = sealed.slice();
+  tampered[tampered.length - 1]! ^= 1;
+  assert.equal(cipher.open(bytes(VECTOR.key), tampered), null, 'tampered');
+  assert.equal(cipher.open(bytes(VECTOR.key), bytes('short')), null, 'too short to be sealed');
+
+  // A fresh nonce each time: the same value never seals the same way twice.
+  assert.notDeepEqual(cipher.seal(bytes('k'), bytes('v')), cipher.seal(bytes('k'), bytes('v')));
+});
+
+test('an encryption key is 32 bytes or 64 hexadecimal characters', () => {
+  const { kv } = client([]);
+  assert.deepEqual(encryptionKeyBytes(KEY_HEX), KEY);
+  assert.deepEqual(encryptionKeyBytes(KEY_HEX.toUpperCase()), KEY);
+  assert.equal(kv.database('a', { encryptionKey: KEY_HEX }).encrypted, true);
+  assert.equal(kv.database('a').encrypted, false);
+  for (const wrong of [new Uint8Array(16), 'abc', KEY_HEX.slice(2), `${KEY_HEX.slice(2)}zz`]) {
+    assert.throws(() => kv.database('a', { encryptionKey: wrong }), { code: 'BAD_REQUEST' });
+  }
+});
+
+test('with a key, put sends ciphertext and get returns the value', async () => {
+  const { kv, seen } = client([{ json: { lsn: 1 } }]);
+  const db = kv.database(VECTOR.database, { encryptionKey: KEY });
+  await db.put(VECTOR.key, VECTOR.value);
+  const sent = seen[0]!.body as Uint8Array;
+  assert.equal(sent.length, VECTOR.value.length + ENCRYPTION_OVERHEAD);
+  assert.ok(!Buffer.from(sent).includes(Buffer.from(VECTOR.value)), 'the value is not sent in clear');
+
+  const { kv: reader } = client([{ bytes: sent }, { bytes: Buffer.from(VECTOR.sealed, 'hex') }]);
+  const same = reader.database(VECTOR.database, { encryptionKey: KEY_HEX });
+  assert.equal(await same.getText(VECTOR.key), VECTOR.value);
+  assert.equal(await same.getText(VECTOR.key), VECTOR.value, 'a value sealed by another client opens');
+});
+
+test('with the wrong key, or a value that was not encrypted, reads fail with INVALID_ENCRYPTION_KEY', async () => {
+  const sealed = Buffer.from(VECTOR.sealed, 'hex');
+  const { kv } = client([{ bytes: sealed }, { bytes: bytes('plain text') }, { bytes: sealed }]);
+  const wrongKey = kv.database(VECTOR.database, { encryptionKey: OTHER_KEY });
+  await assert.rejects(wrongKey.get(VECTOR.key), (error: EdgeKVError) => {
+    assert.equal(error.code, 'INVALID_ENCRYPTION_KEY');
+    assert.deepEqual(error.key, bytes(VECTOR.key));
+    return true;
+  });
+  await assert.rejects(kv.database(VECTOR.database, { encryptionKey: KEY }).get(VECTOR.key), { code: 'INVALID_ENCRYPTION_KEY' });
+  // Without a key, the stored bytes come back as they are.
+  assert.deepEqual(await kv.database(VECTOR.database).get(VECTOR.key), new Uint8Array(sealed));
+});
+
+test('with a key, commits seal each value under its own key, and scans open them', async () => {
+  const { kv, seen } = client([{ json: { lsn: 2 } }]);
+  const db = kv.database('memory', { encryptionKey: KEY });
+  await db.commit([
+    { op: 'put', key: 'facts/a', value: 'one' },
+    { op: 'put', key: 'facts/b', value: 'two' },
+    { op: 'delete', key: 'facts/c' },
+  ]);
+  const ops = (JSON.parse(seen[0]!.body as string) as { ops: { op: string; key: string; value?: string }[] }).ops;
+  assert.deepEqual(ops[2], { op: 'delete', key: b64('facts/c') });
+
+  const items = [
+    { key: ops[0]!.key, value: ops[0]!.value!, version: 'v1' },
+    { key: ops[1]!.key, value: ops[1]!.value!, version: 'v2' },
+  ];
+  const { kv: reader } = client([{ json: { items, next_page_token: null } }, { json: { items: [{ ...items[0]!, key: b64('facts/b') }], next_page_token: null } }]);
+  const listed = [];
+  for await (const entry of reader.database('memory', { encryptionKey: KEY }).scan({ prefix: 'facts/' })) {
+    listed.push([entry.key, new TextDecoder().decode(entry.value), entry.version]);
+  }
+  assert.deepEqual(listed, [
+    ['facts/a', 'one', 'v1'],
+    ['facts/b', 'two', 'v2'],
+  ]);
+  // A value moved under another key does not open.
+  await assert.rejects(reader.database('memory', { encryptionKey: KEY }).scanPage(), { code: 'INVALID_ENCRYPTION_KEY' });
+});
+
+test('update reads, decrypts, and writes back sealed under the version it read', async () => {
+  const cipher = new ValueCipher(KEY, 'counters');
+  const { kv, seen } = client([
+    { bytes: cipher.seal(bytes('hits'), bytes('41')), headers: { 'x-edgekv-version': 'v7' } },
+    { json: { lsn: 8 } },
+  ]);
+  await kv.database('counters', { encryptionKey: KEY }).update('hits', (current) => String(Number(new TextDecoder().decode(current!)) + 1));
+  assert.equal(seen[1]!.headers['if-match'], 'v7');
+  assert.deepEqual(cipher.open(bytes('hits'), seen[1]!.body as Uint8Array), bytes('42'));
 });

@@ -4,7 +4,8 @@ Talks to the service over HTTPS with an API key, or with access tokens your
 backend mints. It keeps no local copy: every read and write is a request. (The
 Rust library is the one that keeps a local replica and works offline.)
 
-Uses only the standard library. Python 3.9 or later.
+Uses only the standard library, and the ``cryptography`` package to encrypt
+values (``pip install "valkv-edgekv[encryption]"``). Python 3.9 or later.
 """
 
 from __future__ import annotations
@@ -21,7 +22,10 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
+from ._crypto import ENCRYPTION_OVERHEAD, ValueCipher
+
 __all__ = [
+    "ENCRYPTION_OVERHEAD",
     "EdgeKV",
     "Database",
     "Databases",
@@ -356,13 +360,38 @@ class _Client:
 class Database:
     """One database's contents. Get one from :meth:`EdgeKV.database`."""
 
-    def __init__(self, client: _Client, name: str) -> None:
+    def __init__(self, client: _Client, name: str, cipher: Optional[ValueCipher] = None) -> None:
         self._client = client
+        self._cipher = cipher
         #: The database's name within the account.
         self.name = name
 
+    @property
+    def encrypted(self) -> bool:
+        """True if values are encrypted here before they are sent."""
+        return self._cipher is not None
+
     def _path(self, rest: str) -> str:
         return f"/v1/db/{urllib.parse.quote(self.name, safe='')}{rest}"
+
+    def _sealed(self, key: bytes, value: bytes) -> bytes:
+        """The value to send for ``key``: encrypted when there is a key."""
+        return value if self._cipher is None else self._cipher.seal(key, value)
+
+    def _opened(self, key: bytes, stored: bytes) -> bytes:
+        """The value as read for ``key``: decrypted when there is a key."""
+        if self._cipher is None:
+            return stored
+        value = self._cipher.open(key, stored)
+        if value is None:
+            raise EdgeKVError(
+                "INVALID_ENCRYPTION_KEY",
+                f"the value of {key.decode('utf-8', 'replace')} could not be decrypted: "
+                "another key encrypted it, or it was not encrypted",
+                0,
+                key,
+            )
+        return value
 
     def get(self, key: str) -> Optional[bytes]:
         """The value stored under ``key``, or ``None`` if there is none."""
@@ -377,7 +406,7 @@ class Database:
             if error.code == "KEY_NOT_FOUND":
                 return None
             raise
-        return Versioned(value, headers.get("x-edgekv-version", ""))
+        return Versioned(self._opened(_to_bytes(key), value), headers.get("x-edgekv-version", ""))
 
     def get_text(self, key: str) -> Optional[str]:
         """The value as text, or ``None``."""
@@ -400,7 +429,7 @@ class Database:
         reply = self._client.send_json(
             "PUT",
             self._path(f"/kv/{_key_path(key)}"),
-            body=_to_bytes(value),
+            body=self._sealed(_to_bytes(key), _to_bytes(value)),
             headers=_condition_headers(if_version, if_absent),
         )
         return int(reply["lsn"])
@@ -482,7 +511,9 @@ class Database:
         for operation in operations:
             kind = operation.get("op")
             if kind == "put":
-                ops.append({"op": "put", "key": _b64(operation["key"]), "value": _b64(operation["value"])})
+                key = _to_bytes(operation["key"])
+                value = self._sealed(key, _to_bytes(operation["value"]))
+                ops.append({"op": "put", "key": _b64(key), "value": _b64(value)})
             elif kind == "delete":
                 ops.append({"op": "delete", "key": _b64(operation["key"])})
             else:
@@ -502,7 +533,7 @@ class Database:
         items = []
         for item in page["items"]:
             key_bytes = base64.b64decode(item["key"])
-            value = base64.b64decode(item["value"])
+            value = self._opened(key_bytes, base64.b64decode(item["value"]))
             items.append(Entry(key_bytes.decode("utf-8", "replace"), key_bytes, value, item.get("version")))
         return Page(items, page.get("next_page_token"))
 
@@ -670,16 +701,33 @@ class EdgeKV:
             raise EdgeKVError("BAD_REQUEST", "managing databases needs control_url", 0)
         return self._control
 
-    def database(self, name: str) -> Database:
+    def database(self, name: str, *, encryption_key: Optional[Union[bytes, str]] = None) -> Database:
         """A database by name. Makes no request: a wrong name shows up as
-        ``NOT_FOUND`` on first use."""
+        ``NOT_FOUND`` on first use.
+
+        :param encryption_key: 32 bytes, or 64 hexadecimal characters. Values
+            are encrypted with it in this process before they are sent, and
+            decrypted when read: the service stores only ciphertext. The format
+            is the one local replicas use, so they read these values with the
+            same key, and this reads theirs. Keys (the names) are not
+            encrypted. A lost key cannot be recovered. Without it, values are
+            sent as they are. Use one choice per database: reading a value
+            written without the key, or with another key, raises
+            ``INVALID_ENCRYPTION_KEY``. Needs ``pip install "valkv-edgekv[encryption]"``.
+        """
+        cipher = None
+        if encryption_key is not None:
+            try:
+                cipher = ValueCipher(encryption_key, name)
+            except (ValueError, ImportError) as error:
+                raise EdgeKVError("BAD_REQUEST", str(error), 0) from None
         if self._tokens is None:
-            return Database(self._data, name)
+            return Database(self._data, name, cipher)
         with self._caches_lock:
             cache = self._caches.get(name)
             if cache is None:
                 cache = self._caches[name] = _TokenCache(self._tokens, name)
-        return Database(self._data.with_credential(cache), name)
+        return Database(self._data.with_credential(cache), name, cipher)
 
     def regions(self) -> List[str]:
         """Regions a database can be created in."""

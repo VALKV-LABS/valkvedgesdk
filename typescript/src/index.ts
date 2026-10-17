@@ -11,6 +11,10 @@
  * and installed with this package. See `local.ts`.
  */
 
+import { ValueCipher } from './crypto.js';
+
+export { ENCRYPTION_OVERHEAD } from './crypto.js';
+
 /** A value to store: bytes, or text, which is stored as UTF-8. */
 export type Value = Uint8Array | string;
 
@@ -374,6 +378,22 @@ class Transport {
   }
 }
 
+export interface DatabaseOptions {
+  /**
+   * 32 bytes, or 64 hexadecimal characters. Values are encrypted with it in
+   * this process before they are sent, and decrypted when read: the service
+   * stores only ciphertext. The format is the one `LocalEdgeKV` and the Rust
+   * library use, so they read these values with the same key, and this reads
+   * theirs. Keys (the names) are not encrypted. A lost key cannot be
+   * recovered. Without it, values are sent as they are.
+   *
+   * Use one choice per database: a database is either encrypted, with one
+   * key, or not. Reading a value written without the key, or with another
+   * key, fails with `INVALID_ENCRYPTION_KEY`.
+   */
+  encryptionKey?: Uint8Array | string;
+}
+
 /** One database's contents. Get one from `EdgeKV.database(name)`. */
 export class Database {
   /** @internal */
@@ -381,10 +401,36 @@ export class Database {
     private readonly transport: Transport,
     /** The database's name within the account. */
     readonly name: string,
+    private readonly cipher?: ValueCipher,
   ) {}
+
+  /** True if values are encrypted here before they are sent. */
+  get encrypted(): boolean {
+    return this.cipher !== undefined;
+  }
 
   private path(rest: string): string {
     return `/v1/db/${encodeURIComponent(this.name)}${rest}`;
+  }
+
+  /** The value to send for `key`: encrypted when there is a key. */
+  private sealed(key: Uint8Array, value: Uint8Array): Uint8Array {
+    return this.cipher ? this.cipher.seal(key, value) : value;
+  }
+
+  /** The value as read for `key`: decrypted when there is a key. */
+  private opened(key: Uint8Array, stored: Uint8Array): Uint8Array {
+    if (!this.cipher) return stored;
+    const value = this.cipher.open(key, stored);
+    if (value === null) {
+      throw new EdgeKVError(
+        'INVALID_ENCRYPTION_KEY',
+        `the value of ${decoder.decode(key)} could not be decrypted: another key encrypted it, or it was not encrypted`,
+        0,
+        key,
+      );
+    }
+    return value;
   }
 
   /** The value stored under `key`, or `null` if there is none. */
@@ -396,7 +442,8 @@ export class Database {
   async getVersioned(key: string): Promise<Versioned | null> {
     try {
       const response = await this.transport.send('GET', this.path(`/kv/${keyPath(key)}`));
-      return { value: new Uint8Array(await response.arrayBuffer()), version: response.headers.get('x-edgekv-version') ?? '' };
+      const stored = new Uint8Array(await response.arrayBuffer());
+      return { value: this.opened(toBytes(key), stored), version: response.headers.get('x-edgekv-version') ?? '' };
     } catch (error) {
       if (error instanceof EdgeKVError && error.code === 'KEY_NOT_FOUND') return null;
       throw error;
@@ -422,7 +469,7 @@ export class Database {
    */
   async put(key: string, value: Value, condition: WriteCondition = {}): Promise<WriteResult> {
     const response = await this.transport.send('PUT', this.path(`/kv/${keyPath(key)}`), {
-      body: toBytes(value) as BodyInit,
+      body: this.sealed(toBytes(key), toBytes(value)) as BodyInit,
       headers: conditionHeaders(condition),
     });
     return (await response.json()) as WriteResult;
@@ -449,11 +496,12 @@ export class Database {
    */
   async commit(operations: Operation[], options: { conditions?: Condition[] } = {}): Promise<CommitResult> {
     if (operations.length === 0) throw new EdgeKVError('BAD_REQUEST', 'a commit needs at least one operation', 0);
-    const ops = operations.map((operation) =>
-      operation.op === 'put'
-        ? { op: 'put', key: toBase64(toBytes(operation.key)), value: toBase64(toBytes(operation.value)) }
-        : { op: 'delete', key: toBase64(toBytes(operation.key)) },
-    );
+    const ops = operations.map((operation) => {
+      const key = toBytes(operation.key);
+      return operation.op === 'put'
+        ? { op: 'put', key: toBase64(key), value: toBase64(this.sealed(key, toBytes(operation.value))) }
+        : { op: 'delete', key: toBase64(key) };
+    });
     const conditions = options.conditions?.map((c) => ({ key: toBase64(toBytes(c.key)), version: c.version }));
     const response = await this.transport.send('POST', this.path('/commit'), {
       json: conditions?.length ? { ops, conditions } : { ops },
@@ -507,7 +555,8 @@ export class Database {
     return {
       items: page.items.map((item) => {
         const keyBytes = fromBase64(item.key);
-        const entry: Entry = { key: decoder.decode(keyBytes), keyBytes, value: fromBase64(item.value) };
+        const value = this.opened(keyBytes, fromBase64(item.value));
+        const entry: Entry = { key: decoder.decode(keyBytes), keyBytes, value };
         if (item.version !== undefined) entry.version = item.version;
         return entry;
       }),
@@ -673,15 +722,27 @@ export class EdgeKV {
     return this.control;
   }
 
-  /** A database by name. Makes no request: a wrong name shows up as `NOT_FOUND` on first use. */
-  database(name: string): Database {
-    if (!this.tokens) return new Database(this.data, name);
+  /**
+   * A database by name. Makes no request: a wrong name shows up as
+   * `NOT_FOUND` on first use. With `encryptionKey`, values are encrypted
+   * before they leave this process.
+   */
+  database(name: string, options: DatabaseOptions = {}): Database {
+    let cipher: ValueCipher | undefined;
+    if (options.encryptionKey !== undefined) {
+      try {
+        cipher = new ValueCipher(options.encryptionKey, name);
+      } catch (error) {
+        throw new EdgeKVError('BAD_REQUEST', (error as Error).message, 0);
+      }
+    }
+    if (!this.tokens) return new Database(this.data, name, cipher);
     let credential = this.credentials.get(name);
     if (!credential) {
       credential = new TokenCredential(this.tokens, name);
       this.credentials.set(name, credential);
     }
-    return new Database(this.data.with(credential), name);
+    return new Database(this.data.with(credential), name, cipher);
   }
 
   /** Regions a database can be created in. */
