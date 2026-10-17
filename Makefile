@@ -7,12 +7,16 @@ TS = docker run --rm -v "$(CURDIR)/typescript":/app -v vkesdk-ts-modules:/app/no
 PY = docker run --rm -v "$(CURDIR)/python":/app:ro -w /app -e PYTHONPATH=/app/src -e PYTHONDONTWRITEBYTECODE=1 \
      --add-host=host.docker.internal:host-gateway
 
-.PHONY: help test integ ts-test ts-integ py-test py-integ native-gnu native-musl native-test
+# The MCP server uses the TypeScript SDK from ../typescript, so both are mounted.
+MCP = docker run --rm -v "$(CURDIR)/typescript":/sdk/typescript -v vkesdk-ts-modules:/sdk/typescript/node_modules \
+      -v "$(CURDIR)/mcp":/sdk/mcp -v vkesdk-mcp-modules:/sdk/mcp/node_modules -w /sdk/mcp
+
+.PHONY: help test integ ts-test ts-integ py-test py-integ mcp-test native-gnu native-musl native-test
 
 help: ## List the commands
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-12s %s\n", $$1, $$2}'
 
-test: ts-test py-test ## Every SDK's unit tests (no network)
+test: ts-test py-test mcp-test ## Every SDK's unit tests, and the MCP server's (no network)
 
 # The integration targets need a running service and a key that may manage databases:
 #   make integ EDGEKV_URL=... EDGEKV_CONTROL_URL=... EDGEKV_API_KEY=ekv_...
@@ -25,12 +29,17 @@ ts-integ: ## TypeScript SDK against a running service
 	$(TS) -e EDGEKV_URL -e EDGEKV_CONTROL_URL -e EDGEKV_API_KEY $(NODE_IMAGE) \
 	    sh -c "npm install --no-audit --no-fund --loglevel=error && npm run test:integration"
 
-py-test: ## Python SDK: unit tests, on the oldest and the newest supported Python
+py-test: ## Python SDK: unit tests, on the oldest Python as installed, and the newest with encryption
 	$(PY) python:3.9-slim python -m unittest -v tests.test_unit
-	$(PY) $(PYTHON_IMAGE) python -m unittest tests.test_unit
+	$(PY) $(PYTHON_IMAGE) sh -c "pip install --quiet --root-user-action=ignore 'cryptography>=42' && python -m unittest -v tests.test_unit"
+
+mcp-test: ## MCP server: type-check, tests and build, on the TypeScript SDK as it is here
+	$(MCP) $(NODE_IMAGE) sh -c "cd ../typescript && npm install --no-audit --no-fund --loglevel=error && npm run build \
+	    && cd ../mcp && npm install --no-audit --no-fund --loglevel=error && npm run typecheck && npm test && npm run build"
 
 py-integ: ## Python SDK against a running service
-	$(PY) -e EDGEKV_URL -e EDGEKV_CONTROL_URL -e EDGEKV_API_KEY $(PYTHON_IMAGE) python -m unittest -v tests.test_integration
+	$(PY) -e EDGEKV_URL -e EDGEKV_CONTROL_URL -e EDGEKV_API_KEY $(PYTHON_IMAGE) \
+	    sh -c "pip install --quiet --root-user-action=ignore 'cryptography>=42' && python -m unittest -v tests.test_integration"
 
 # The native library behind the TypeScript SDK's local mode, built for Linux on
 # this machine's architecture into typescript/npm/. macOS and Windows builds

@@ -11,6 +11,10 @@ requires-python = ">=3.9"
 license = { text = "MIT OR Apache-2.0" }
 dependencies = []
 
+[project.optional-dependencies]
+# Encrypting values before they are sent: EdgeKV.database(name, encryption_key=...).
+encryption = ["cryptography>=42"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

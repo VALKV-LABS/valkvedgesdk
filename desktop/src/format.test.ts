@@ -3,6 +3,7 @@ import {
   asHex,
   asText,
   explain,
+  matching,
   formatBytes,
   fromBase64,
   fromHex,
@@ -110,5 +111,19 @@ describe('explaining a failure', () => {
   it('falls back to the service message, then to the code', () => {
     expect(explain({ code: 'INVALID_NAME', message: 'name must be 2 to 48 characters' })).toBe('name must be 2 to 48 characters')
     expect(explain({ code: 'SOMETHING_NEW', message: '' })).toBe('SOMETHING_NEW')
+  })
+})
+
+describe('matching', () => {
+  const databases = [{ name: 'orders' }, { name: 'orders-archive' }, { name: 'logs' }]
+
+  it('keeps every database when nothing is typed', () => {
+    expect(matching(databases, '  ')).toEqual(databases)
+  })
+
+  it('keeps the names that contain what was typed, in any case', () => {
+    expect(matching(databases, 'ORDER').map((d) => d.name)).toEqual(['orders', 'orders-archive'])
+    expect(matching(databases, 'arch').map((d) => d.name)).toEqual(['orders-archive'])
+    expect(matching(databases, 'nothing')).toEqual([])
   })
 })

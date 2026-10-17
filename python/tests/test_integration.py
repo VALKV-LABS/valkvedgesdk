@@ -10,7 +10,14 @@ import threading
 import time
 import unittest
 
-from edgekv import EdgeKV, EdgeKVError
+from edgekv import ENCRYPTION_OVERHEAD, EdgeKV, EdgeKVError
+
+try:
+    import cryptography  # noqa: F401
+
+    HAVE_CRYPTOGRAPHY = True
+except ImportError:
+    HAVE_CRYPTOGRAPHY = False
 
 
 def env(name):
@@ -199,6 +206,27 @@ class IntegrationTests(unittest.TestCase):
         stranger = EdgeKV("ekv_this-key-was-never-issued-000000", env("EDGEKV_URL"), env("EDGEKV_CONTROL_URL"))
         self.assertFails("UNAUTHENTICATED", lambda: stranger.database(self.name).get("k"), 401)
         self.assertFails("UNAUTHENTICATED", stranger.regions)
+
+    @unittest.skipUnless(HAVE_CRYPTOGRAPHY, 'needs pip install "valkv-edgekv[encryption]"')
+    def test_with_an_encryption_key_the_service_stores_ciphertext_and_the_key_reads_it_back(self):
+        key = os.urandom(32)
+        sealed = self.kv.database(self.name, encryption_key=key)
+        sealed.put("secret/one", "private value")
+        sealed.commit([{"op": "put", "key": "secret/two", "value": "second"}])
+
+        stored = self.db.get("secret/one")
+        self.assertEqual(len(stored), len("private value") + ENCRYPTION_OVERHEAD)
+        self.assertNotIn(b"private value", stored)
+
+        self.assertEqual(sealed.get_text("secret/one"), "private value")
+        self.assertEqual(
+            [(e.key, e.value) for e in sealed.scan(prefix="secret/")],
+            [("secret/one", b"private value"), ("secret/two", b"second")],
+        )
+        sealed.update("secret/one", lambda current: current + b", changed")
+        self.assertEqual(sealed.get_text("secret/one"), "private value, changed")
+        self.assertFails("INVALID_ENCRYPTION_KEY", lambda: self.kv.database(self.name, encryption_key=bytes(32)).get("secret/one"))
+        self.db.commit([{"op": "delete", "key": k} for k in ("secret/one", "secret/two")])
 
     def test_a_deleted_database_stops_being_served(self):
         doomed = self.kv.databases.create(f"{self.name}-gone", self.info.region)

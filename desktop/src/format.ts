@@ -108,7 +108,7 @@ export function nameProblem(name: string): string | null {
   return null
 }
 
-/** How far behind a device is, in words. */
+/** How far behind a replica is, in words. */
 export function lagText(lag: number | null): string {
   if (lag === null) return 'not known'
   if (lag === 0) return 'up to date'
@@ -139,4 +139,10 @@ export function explain(error: { code: string; message: string }): string {
     default:
       return error.message || error.code
   }
+}
+
+/** The databases whose name contains what was typed in the search box. */
+export function matching<T extends { name: string }>(databases: T[], filter: string): T[] {
+  const wanted = filter.trim().toLowerCase()
+  return wanted ? databases.filter((database) => database.name.includes(wanted)) : databases
 }

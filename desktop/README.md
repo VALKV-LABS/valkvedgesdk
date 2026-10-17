@@ -7,7 +7,7 @@ A desktop application for looking at your ValkvEdgeKV databases and what is in t
 - Browse a database's entries in key order, filter by prefix, and page through them.
 - Add, edit and delete entries. Values are shown as JSON, text or hex, whichever they
   are, and can be typed as text or hex.
-- See which devices sync a database, whether each is connected, and how far behind it is.
+- See the replicas of a database (each local copy the library keeps in sync), whether each is connected, and how far behind it is.
 
 It is built with [Tauri](https://tauri.app): a small native program with the interface
 in the system's web view. It runs on Windows and macOS.

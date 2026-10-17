@@ -6,7 +6,7 @@
 //   EDGEKV_API_KEY      a key that may manage databases
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
-import { EdgeKV, EdgeKVError, type DatabaseInfo } from '../src/index.js';
+import { ENCRYPTION_OVERHEAD, EdgeKV, EdgeKVError, type DatabaseInfo } from '../src/index.js';
 
 const env = (name: string): string => {
   const value = process.env[name];
@@ -198,6 +198,33 @@ test('a database that does not exist, and a key that is wrong, are told apart', 
   const stranger = new EdgeKV({ apiKey: 'ekv_this-key-was-never-issued-000000', url: env('EDGEKV_URL'), controlUrl: env('EDGEKV_CONTROL_URL') });
   await assert.rejects(stranger.database(name).get('k'), { code: 'UNAUTHENTICATED', status: 401 });
   await assert.rejects(stranger.regions(), { code: 'UNAUTHENTICATED' });
+});
+
+test('with an encryption key, the service stores ciphertext and the key reads it back', async () => {
+  const key = crypto.getRandomValues(new Uint8Array(32));
+  const sealed = kv.database(name, { encryptionKey: key });
+  await sealed.put('secret/one', 'private value');
+  await sealed.commit([
+    { op: 'put', key: 'secret/two', value: 'second' },
+    { op: 'put', key: 'secret/three', value: 'third' },
+  ]);
+
+  // What the service holds, read without the key.
+  const stored = await db.get('secret/one');
+  assert.ok(stored);
+  assert.equal(stored.length, 'private value'.length + ENCRYPTION_OVERHEAD);
+  assert.ok(!text(stored)!.includes('private value'));
+
+  assert.equal(await sealed.getText('secret/one'), 'private value');
+  const listed: string[] = [];
+  for await (const entry of sealed.scan({ prefix: 'secret/' })) listed.push(`${entry.key}=${text(entry.value)}`);
+  assert.deepEqual(listed, ['secret/one=private value', 'secret/three=third', 'secret/two=second']);
+  await sealed.update('secret/one', (current) => `${text(current)}, changed`);
+  assert.equal(await sealed.getText('secret/one'), 'private value, changed');
+
+  const wrong = kv.database(name, { encryptionKey: new Uint8Array(32) });
+  await assert.rejects(wrong.get('secret/one'), { code: 'INVALID_ENCRYPTION_KEY' });
+  await db.commit(['secret/one', 'secret/two', 'secret/three'].map((k) => ({ op: 'delete' as const, key: k })));
 });
 
 test('a deleted database stops being served', async () => {

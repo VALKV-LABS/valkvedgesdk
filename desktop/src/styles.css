@@ -106,7 +106,6 @@ header { display: flex; justify-content: space-between; align-items: flex-start;
 .tabs button.selected { border-bottom-color: var(--accent); font-weight: 600; }
 
 .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
-.editor { margin-bottom: 14px; }
 
 table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
 th, td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
@@ -123,3 +122,60 @@ td.actions { white-space: nowrap; text-align: right; }
 .notice { display: flex; justify-content: space-between; gap: 12px; padding: 8px 14px; }
 .notice.error { background: var(--error-bg); color: var(--danger); }
 .notice.ok { background: var(--ok-bg); }
+
+/* Database list: search, a status dot, the size. */
+.pad-x { padding: 8px 10px 0; }
+.count { font-weight: 400; margin-left: 4px; }
+.database { gap: 8px; }
+.database .size { font-size: 11px; }
+.dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--muted); }
+.dot.ok { background: var(--accent); }
+.dot.warn { background: #d4a72c; }
+
+/* What is known about the open database, at a glance. */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
+.chip { font-size: 12px; border: 1px solid var(--line); border-radius: 6px; padding: 1px 8px; background: var(--panel); }
+
+.welcome { max-width: 420px; text-align: center; }
+.about { color: var(--muted); max-width: 720px; margin: 0 0 12px; }
+
+/* Entries open by clicking their row. */
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: var(--bg); }
+
+/* The entry editor: a panel from the right. */
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: rgb(0 0 0 / 0.25);
+  cursor: default;
+  z-index: 10;
+}
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(480px, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px 18px;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  box-shadow: -8px 0 24px rgb(0 0 0 / 0.15);
+  overflow: auto;
+  z-index: 11;
+}
+.drawer-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.drawer-head h3 { margin: 0; }
+.drawer textarea { min-height: 220px; }
+.meta { font-weight: 400; font-size: 11px; }
+.advanced { margin: 4px 0 12px; }
+.advanced summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.advanced[open] summary { margin-bottom: 6px; }
+.drawer-actions { margin-top: auto; padding-top: 10px; }
+.push { margin-left: auto; }

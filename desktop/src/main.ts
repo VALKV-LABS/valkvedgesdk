@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import { asHex, asText, explain, formatBytes, formatTime, fromBase64, fromHex, lagText, nameProblem, show, toBase64 } from './format'
+import { asHex, asText, explain, formatBytes, formatTime, fromBase64, fromHex, lagText, matching, nameProblem, show, toBase64 } from './format'
 import './styles.css'
 
 // What the native half answers with. See src-tauri/src/client.rs.
@@ -18,7 +18,7 @@ interface Database {
   created_at: string
   stored_bytes: number | null
 }
-interface Device {
+interface Replica {
   id: string
   last_seen_at: string
   lsn: number | null
@@ -41,9 +41,9 @@ interface Open {
   id: string | null
   name: string
   details: Database | null
-  devices: Device[]
+  replicas: Replica[]
   lsn: number | null
-  tab: 'data' | 'devices'
+  tab: 'data' | 'replicas'
   prefix: string
   entries: Entry[]
   nextPageToken: string | null
@@ -60,6 +60,8 @@ const state = {
   canManage: true,
   regions: [] as string[],
   open: null as Open | null,
+  /** What the database list is narrowed to, as typed in its search box. */
+  databaseFilter: '',
   creating: false,
   busy: false,
   notice: null as { kind: 'error' | 'ok'; text: string } | null,
@@ -151,7 +153,7 @@ async function openDatabase(id: string | null, name: string) {
     id,
     name,
     details: null,
-    devices: [],
+    replicas: [],
     lsn: null,
     tab: 'data',
     prefix: '',
@@ -169,9 +171,9 @@ async function refreshOpen(done?: string) {
   if (!open) return
   await attempt(async () => {
     if (open.id) {
-      const details = await invoke<{ database: Database; devices: Device[]; lsn: number | null }>('database_details', { id: open.id })
+      const details = await invoke<{ database: Database; replicas: Replica[]; lsn: number | null }>('database_details', { id: open.id })
       open.details = details.database
-      open.devices = details.devices
+      open.replicas = details.replicas
       open.lsn = details.lsn
     } else {
       open.lsn = await invoke<number>('probe_database', { name: open.name })
@@ -266,6 +268,7 @@ async function deleteEntry(key: string) {
   if (!open) return
   const done = await attempt(() => invoke<number>('delete_entry', { database: open.name, key }))
   if (done === undefined) return
+  if (open.editing === key) open.editing = null
   await refreshOpen('Deleted.')
 }
 
@@ -296,6 +299,7 @@ function connectionScreen(info: ConnectionInfo): string {
 
 function sidebar(): string {
   const open = state.open
+  const shown = state.databases ? matching(state.databases, state.databaseFilter) : []
   const list =
     state.databases === null
       ? '<p class="muted pad">Loading…</p>'
@@ -309,17 +313,23 @@ function sidebar(): string {
           </div>`
         : state.databases.length === 0
           ? '<p class="muted pad" data-testid="no-databases">No databases yet.</p>'
-          : `<ul class="databases" data-testid="databases">${state.databases
-              .map(
-                (database) => `
+          : `<div class="search pad-x"><input type="search" placeholder="Search ${state.databases.length} databases" value="${escape(state.databaseFilter)}" data-testid="database-search" aria-label="Search databases" /></div>
+            ${
+              shown.length === 0
+                ? '<p class="muted pad">No database name contains that.</p>'
+                : `<ul class="databases" data-testid="databases">${shown
+                    .map(
+                      (database) => `
               <li>
-                <button class="database ${open?.id === database.id ? 'selected' : ''}" data-open="${escape(database.id)}" data-name="${escape(database.name)}">
-                  <span class="mono">${escape(database.name)}</span>
-                  <span class="tag ${database.status === 'active' ? 'ok' : ''}">${escape(database.status)}</span>
+                <button class="database ${open?.id === database.id ? 'selected' : ''}" data-open="${escape(database.id)}" data-name="${escape(database.name)}" title="${escape(database.status)}">
+                  <span class="dot ${database.status === 'active' ? 'ok' : 'warn'}" aria-label="${escape(database.status)}"></span>
+                  <span class="mono grow">${escape(database.name)}</span>
+                  <span class="muted size">${database.stored_bytes != null ? formatBytes(database.stored_bytes) : ''}</span>
                 </button>
               </li>`,
-              )
-              .join('')}</ul>`
+                    )
+                    .join('')}</ul>`
+            }`
   const create = !state.canManage
     ? ''
     : state.creating
@@ -337,7 +347,7 @@ function sidebar(): string {
   return `
   <aside>
     <div class="aside-head">
-      <strong>Databases</strong>
+      <strong>Databases${state.databases?.length ? ` <span class="muted count">${state.databases.length}</span>` : ''}</strong>
       <button class="link" data-action="refresh-databases" title="Refresh the list">Refresh</button>
     </div>
     ${list}
@@ -354,26 +364,39 @@ function editor(open: Open): string {
   const existing = open.editing ? open.entries.find((entry) => entry.key === open.editing) : undefined
   const keyBytes = open.editing ? fromBase64(open.editing) : new Uint8Array()
   const keyText = asText(keyBytes)
-  const value = existing ? show(fromBase64(existing.value)) : null
+  const valueBytes = existing ? fromBase64(existing.value) : null
+  const value = valueBytes ? show(valueBytes) : null
   const valueIsBinary = value?.kind === 'binary'
+  const keyIsBinary = Boolean(open.editing) && keyText === null
+  // Most keys and values are text or JSON: binary input is tucked away, and
+  // opened by itself only when what is being edited is not text.
   return `
-  <form class="card editor" data-form="entry" aria-label="${open.editing ? 'Edit entry' : 'New entry'}">
-    <h3>${open.editing ? 'Edit entry' : 'New entry'}</h3>
+  <button type="button" class="drawer-backdrop" data-action="cancel-edit" aria-label="Close the editor" tabindex="-1"></button>
+  <form class="drawer" data-form="entry" aria-label="${open.editing ? 'Edit entry' : 'New entry'}">
+    <div class="drawer-head">
+      <h3>${open.editing ? 'Edit entry' : 'New entry'}</h3>
+      <button type="button" class="link" data-action="cancel-edit" aria-label="Close">Close</button>
+    </div>
     <label>Key
       ${
         open.editing
           ? `<input class="mono" disabled value="${escape(keyText ?? asHex(keyBytes))}" />`
-          : `<input class="mono" name="key" required placeholder="order/1001" data-testid="entry-key" />
-             <span class="check"><input type="checkbox" name="key_hex" /> key is hex</span>`
+          : `<input class="mono" name="key" required placeholder="order/1001" data-testid="entry-key" />`
       }
     </label>
-    <label>Value
-      <textarea class="mono" name="value" rows="8" data-testid="entry-value">${escape(value?.full ?? '')}</textarea>
-      <span class="check"><input type="checkbox" name="value_hex" ${valueIsBinary ? 'checked' : ''} /> value is hex</span>
+    <label>Value ${value ? `<span class="muted meta">${value.kind} · ${formatBytes(valueBytes!.length)}</span>` : ''}
+      <textarea class="mono" name="value" rows="14" data-testid="entry-value">${escape(value?.full ?? '')}</textarea>
     </label>
-    <div class="row">
+    <details class="advanced" ${valueIsBinary || keyIsBinary ? 'open' : ''}>
+      <summary>Binary (hex)</summary>
+      <p class="hint">For bytes that are not text: type them as pairs of hex digits, such as <span class="mono">de ad be ef</span>.</p>
+      ${open.editing ? '' : '<span class="check"><input type="checkbox" name="key_hex" /> The key is hex</span>'}
+      <span class="check"><input type="checkbox" name="value_hex" ${valueIsBinary ? 'checked' : ''} /> The value is hex</span>
+    </details>
+    <div class="row drawer-actions">
       <button class="primary" type="submit" ${state.busy ? 'disabled' : ''} data-testid="save-entry">Save</button>
       <button type="button" data-action="cancel-edit">Cancel</button>
+      ${open.editing ? `<button type="button" class="danger push" data-delete-entry="${escape(open.editing)}">Delete</button>` : ''}
     </div>
   </form>`
 }
@@ -385,7 +408,7 @@ function dataTab(open: Open): string {
       const valueBytes = fromBase64(entry.value)
       const shown = show(valueBytes)
       return `
-      <tr data-key="${escape(entry.key)}">
+      <tr data-key="${escape(entry.key)}" class="clickable" title="Open">
         <td class="mono key">${escape(asText(keyBytes) ?? asHex(keyBytes))}</td>
         <td class="mono value"><span class="kind">${shown.kind}</span> ${escape(shown.preview)}</td>
         <td class="num">${formatBytes(valueBytes.length)}</td>
@@ -399,10 +422,10 @@ function dataTab(open: Open): string {
   return `
   <div class="toolbar">
     <form data-form="filter" class="row grow">
-      <input name="prefix" placeholder="Keys starting with…" value="${escape(open.prefix)}" data-testid="prefix" />
+      <input name="prefix" type="search" placeholder="Show keys starting with…" value="${escape(open.prefix)}" data-testid="prefix" />
       <button type="submit" data-testid="filter">Filter</button>
     </form>
-    <button data-action="new-entry" data-testid="new-entry">New entry</button>
+    <button class="primary" data-action="new-entry" data-testid="new-entry">New entry</button>
     <button data-action="refresh-open" data-testid="refresh">Refresh</button>
   </div>
   ${editor(open)}
@@ -419,22 +442,26 @@ function dataTab(open: Open): string {
   }`
 }
 
-function devicesTab(open: Open): string {
-  if (!open.id) return '<p class="muted pad">Devices are listed for keys that can manage databases.</p>'
-  if (open.devices.length === 0) {
-    return '<p class="muted pad" data-testid="no-devices">No device has synced this database yet. A device is listed once it syncs with the library.</p>'
+function replicasTab(open: Open): string {
+  const about = `<p class="about">A <strong>replica</strong> is a local copy of this database that the library keeps in
+    sync, on a server, a laptop or a phone. Each one is listed once it syncs, with whether it is connected and how many
+    writes it is behind. One program that opens five databases has five replicas. Clients that keep no local copy,
+    such as the TypeScript and Python SDKs without one, are not listed.</p>`
+  if (!open.id) return `${about}<p class="muted pad">Replicas are listed for keys that can manage databases.</p>`
+  if (open.replicas.length === 0) {
+    return `${about}<p class="muted pad" data-testid="no-replicas">No replica has synced this database yet.</p>`
   }
-  return `
-  <table data-testid="devices">
-    <thead><tr><th>Device</th><th>Status</th><th>Behind</th><th>Last seen</th></tr></thead>
-    <tbody>${open.devices
+  return `${about}
+  <table data-testid="replicas">
+    <thead><tr><th>Replica</th><th>Status</th><th>Behind</th><th>Last seen</th></tr></thead>
+    <tbody>${open.replicas
       .map(
-        (device) => `
+        (replica) => `
       <tr>
-        <td class="mono">${escape(device.id)}</td>
-        <td><span class="tag ${device.connected ? 'ok' : ''}">${device.connected ? 'connected' : 'offline'}</span></td>
-        <td>${lagText(device.lag)}</td>
-        <td class="muted">${escape(formatTime(device.last_seen_at))}</td>
+        <td class="mono">${escape(replica.id)}</td>
+        <td><span class="tag ${replica.connected ? 'ok' : ''}">${replica.connected ? 'connected' : 'offline'}</span></td>
+        <td>${lagText(replica.lag)}</td>
+        <td class="muted">${escape(formatTime(replica.last_seen_at))}</td>
       </tr>`,
       )
       .join('')}</tbody>
@@ -444,19 +471,28 @@ function devicesTab(open: Open): string {
 function content(): string {
   const open = state.open
   if (!open) {
-    return `<section class="empty"><p class="muted">${state.canManage ? 'Choose a database, or create one.' : 'Open a database by name.'}</p></section>`
+    return `<section class="empty"><div class="card welcome">
+      <h3>${state.canManage ? 'Choose a database' : 'Open a database'}</h3>
+      <p class="muted">${
+        state.canManage
+          ? 'Pick one on the left to see what is in it and which replicas follow it, or create a new one.'
+          : 'This key cannot list databases: type a database name on the left to open it.'
+      }</p></div></section>`
   }
   const details = open.details
+  const chip = (label: string, value: string) => `<span class="chip"><span class="muted">${label}</span> ${value}</span>`
   return `
   <section>
     <header>
       <div>
         <h2 class="mono" data-testid="open-name-title">${escape(open.name)}</h2>
-        <p class="muted">
-          ${details ? `<span class="tag ${details.status === 'active' ? 'ok' : ''}">${escape(details.status)}</span> ${escape(details.region)} · created ${escape(formatTime(details.created_at))}` : ''}
-          ${details?.stored_bytes != null ? ` · ${formatBytes(details.stored_bytes)} stored` : ''}
-          ${open.lsn != null ? ` · ${open.lsn.toLocaleString('en-US')} writes` : ''}
-        </p>
+        <div class="chips">
+          ${details ? `<span class="tag ${details.status === 'active' ? 'ok' : ''}">${escape(details.status)}</span>` : ''}
+          ${details ? chip('Region', `<span class="mono">${escape(details.region)}</span>`) : ''}
+          ${details?.stored_bytes != null ? chip('Stored', formatBytes(details.stored_bytes)) : ''}
+          ${open.lsn != null ? chip('Log position', open.lsn.toLocaleString('en-US')) : ''}
+          ${details ? chip('Created', escape(formatTime(details.created_at))) : ''}
+        </div>
         ${details?.status_reason ? `<p class="error">${escape(details.status_reason)}</p>` : ''}
       </div>
       ${
@@ -473,13 +509,39 @@ function content(): string {
     </header>
     <nav class="tabs">
       <button class="${open.tab === 'data' ? 'selected' : ''}" data-tab="data">Data</button>
-      <button class="${open.tab === 'devices' ? 'selected' : ''}" data-tab="devices" data-testid="devices-tab">Devices${open.devices.length ? ` (${open.devices.length})` : ''}</button>
+      <button class="${open.tab === 'replicas' ? 'selected' : ''}" data-tab="replicas" data-testid="replicas-tab">Replicas${open.replicas.length ? ` (${open.replicas.length})` : ''}</button>
     </nav>
-    ${open.tab === 'data' ? dataTab(open) : devicesTab(open)}
+    ${open.tab === 'data' ? dataTab(open) : replicasTab(open)}
   </section>`
 }
 
+/**
+ * The page is drawn again on every change. Whatever field had the cursor
+ * keeps it, with what was selected, so typing in a search box is not cut off.
+ */
+function keepFocus(draw: () => void) {
+  const active = document.activeElement as HTMLInputElement | null
+  const id = active?.dataset?.testid
+  const selection = id && typeof active?.selectionStart === 'number' ? [active.selectionStart, active.selectionEnd ?? active.selectionStart] : null
+  draw()
+  if (!id) return
+  const again = app.querySelector<HTMLInputElement>(`[data-testid="${id}"]`)
+  if (!again) return
+  again.focus()
+  if (selection) {
+    try {
+      again.setSelectionRange(selection[0]!, selection[1]!)
+    } catch {
+      // Not every field has a selection.
+    }
+  }
+}
+
 function render() {
+  keepFocus(draw)
+}
+
+function draw() {
   const info = state.connection
   if (!info) {
     app.innerHTML = '<main class="center"><p class="muted">Starting…</p></main>'
@@ -521,9 +583,25 @@ app.addEventListener('submit', (event) => {
   }
 })
 
+app.addEventListener('input', (event) => {
+  const input = event.target as HTMLInputElement
+  if (input.dataset.testid === 'database-search') {
+    state.databaseFilter = input.value
+    render()
+  }
+})
+
 app.addEventListener('click', (event) => {
   const target = (event.target as HTMLElement).closest<HTMLElement>('button')
-  if (!target) return
+  // A click anywhere on an entry's row opens it.
+  if (!target) {
+    const row = (event.target as HTMLElement).closest<HTMLElement>('tr[data-key]')
+    if (row && state.open) {
+      state.open.editing = row.dataset.key ?? null
+      render()
+    }
+    return
+  }
   const open = state.open
   if (target.dataset.open) return void openDatabase(target.dataset.open, target.dataset.name ?? '')
   if (target.dataset.tab && open) {

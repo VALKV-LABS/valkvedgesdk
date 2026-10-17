@@ -7,7 +7,7 @@ A client for ValkvEdgeKV, in two modes:
 | Local copy | None: every read and write is a request | On this machine's disk |
 | Reads | Over HTTPS | Local, no network |
 | Writes | Over HTTPS | Stored by the service (`sync`), or on disk at once and pushed later (`buffered`, works offline) |
-| Encryption | | Values encrypted on this machine before they leave it |
+| Encryption | Values encrypted in this process before they are sent | Values encrypted on this machine before they leave it |
 | Runs on | Anywhere `fetch` exists: Node 18+, Deno, Bun, browsers | Node 18+, Bun, Deno on macOS, Linux and Windows (below) |
 
 ```sh
@@ -90,6 +90,29 @@ for await (const entry of db.scan({ prefix: 'order/' })) {
 
 Entries come back in key order, fetched a page at a time as the loop runs. `scanPage`
 gives you one page and a token for the next, if you would rather drive it yourself.
+
+### Encrypting values
+
+```ts
+// 32 bytes, or 64 hexadecimal characters (openssl rand -hex 32). Keep it safe: it cannot be recovered.
+const vault = kv.database('vault', { encryptionKey: process.env.VAULT_KEY! })
+
+await vault.putJson('patient/7', { diagnosis: 'asthma' })   // the service receives ciphertext
+const record = await vault.getJson('patient/7')             // decrypted here
+```
+
+With `encryptionKey`, values are encrypted in this process with ChaCha20-Poly1305
+before they are sent, and decrypted when read: `get`, `scan`, `put`, `commit` and
+`update` all work as before, and the service only ever stores ciphertext. Without it,
+values are sent as they are. Key names, value sizes and timestamps are not encrypted, so
+keep secrets out of key names. Each value grows by `ENCRYPTION_OVERHEAD` (28 bytes).
+
+The format is the one the local mode and the Rust library use: a `LocalEdgeKV`
+replica opened with the same key reads these values, and this reads theirs.
+
+Choose per database, not per write: a database is either encrypted, always with the
+same key, or not at all. Reading a value written without the key, or with another key,
+fails with `INVALID_ENCRYPTION_KEY`.
 
 ### Waiting for changes
 
@@ -202,12 +225,12 @@ then also be `namespace/name`, to keep one user's or one tenant's databases toge
 - **`buffered`** returns once the write is on local disk. It is readable at once, works
   without a network, and is pushed to the service in the background within a few
   seconds. It can be lost if the machine is lost before then, and it can lose to a
-  newer write of the same key from another device: the newer write wins, and
+  newer write of the same key from another replica: the newer write wins, and
   `db.takeEvents()` reports the one that lost.
 
 Set the default for a database with `kv.database(name, { durability: 'buffered' })`.
 
-What other devices write reaches the local copy in the background, about once a second.
+What other replicas write reaches the local copy in the background, about once a second.
 `db.sync()` pushes and pulls now; `db.status()` shows how many buffered writes are still
 waiting.
 
@@ -237,7 +260,9 @@ const vault = await kv.database('vault', { encryptionKey: key })
 Values are encrypted on this machine, before they are written to disk or sent: the
 service only ever holds ciphertext. Key names, value sizes and timestamps are not
 encrypted. Opening the database without the key, or with another key, fails with
-`INVALID_ENCRYPTION_KEY`.
+`INVALID_ENCRYPTION_KEY`. The key is 32 bytes or 64 hexadecimal characters, and an
+`EdgeKV` client given the same key reads and writes the same values without a copy
+(see *Encrypting values* above).
 
 ### Platforms
 
