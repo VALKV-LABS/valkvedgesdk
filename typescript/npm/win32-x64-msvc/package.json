@@ -1,6 +1,6 @@
 {
   "name": "@valkvlabs/edgekv-win32-x64-msvc",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The win32-x64-msvc build of the native library behind @valkvlabs/edgekv. Install @valkvlabs/edgekv, not this.",
   "license": "MIT OR Apache-2.0",
   "repository": {
