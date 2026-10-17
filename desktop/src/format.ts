@@ -140,3 +140,9 @@ export function explain(error: { code: string; message: string }): string {
       return error.message || error.code
   }
 }
+
+/** The databases whose name contains what was typed in the search box. */
+export function matching<T extends { name: string }>(databases: T[], filter: string): T[] {
+  const wanted = filter.trim().toLowerCase()
+  return wanted ? databases.filter((database) => database.name.includes(wanted)) : databases
+}
