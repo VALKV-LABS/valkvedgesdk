@@ -110,6 +110,14 @@ a pre-release. `npm install @valkvlabs/edgekv` keeps installing the last full re
   them; no GitHub Release is created. Look at which platform failed, then release a
   fixed version as above.
 
+## MCP server (npm)
+
+`@valkvlabs/edgekv-mcp` has no release workflow yet. In this repository it depends on
+the SDK as `file:../typescript`, so it always builds and tests against the SDK beside
+it. Before it can be published, that dependency must name a released version of
+`@valkvlabs/edgekv` (one with `encryptionKey` on `EdgeKV.database`, so after 0.1.0), and
+it should be released after that SDK version is public.
+
 ## Desktop application
 
 1. Set the same version in `desktop/package.json`, `desktop/src-tauri/tauri.conf.json`

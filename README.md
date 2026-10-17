@@ -13,6 +13,7 @@ tested. None is published yet.
 | [`typescript/`](typescript/README.md) | `@valkvlabs/edgekv` for TypeScript and JavaScript: reads, writes, scans, waiting for changes, and managing databases; and a local mode with an offline copy on disk | Built; release workflow ready, not run |
 | [`native/`](native/src/lib.rs) | The Rust bindings to the valkvedge library behind the local mode, built for each platform into `typescript/npm/` | Built and tested on Linux (glibc, musl) and Windows |
 | [`python/`](python/README.md) | `valkv-edgekv` for Python: the same, with the same names in Python style | Built |
+| [`mcp/`](mcp/README.md) | `@valkvlabs/edgekv-mcp`: an MCP server that gives an AI agent a database as memory, optionally encrypted on the agent's machine | Built; no release workflow yet |
 | [`desktop/`](desktop/README.md) | Desktop application (Tauri) for Windows and macOS: browse a database and its contents, create and delete databases | Built and tested on Windows; no release yet |
 
 ## What this code talks to
@@ -26,11 +27,12 @@ databases when it was created, they also list, create and delete databases.
 Everything runs in Docker; `make` lists the commands.
 
 ```sh
-make test        # both SDKs: unit tests, no network
+make test        # both SDKs and the MCP server: unit tests, no network
 make integ EDGEKV_URL=… EDGEKV_CONTROL_URL=… EDGEKV_API_KEY=ekv_…   # both, against a running service
 ```
 
-`ts-test`, `ts-integ`, `py-test` and `py-integ` run one SDK at a time. `make native-test`
+`ts-test`, `ts-integ`, `py-test` and `py-integ` run one SDK at a time, and `mcp-test` the
+MCP server. `make native-test`
 builds the native library for Linux and runs the TypeScript local mode on it.
 
 ## Releases
