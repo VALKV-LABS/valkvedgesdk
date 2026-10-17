@@ -1,6 +1,6 @@
 [package]
 name = "edgekv-native"
-version = "0.1.0"
+version = "0.2.0"
 description = "Node.js bindings to the valkvedge library, for the local mode of @valkvlabs/edgekv"
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -14,7 +14,7 @@ napi = { version = "3", default-features = false, features = ["napi6", "async"] 
 napi-derive = "3"
 # Re-pin when the library changes.
 tokio = { version = "1", features = ["sync", "macros"] }
-valkvedge = { git = "https://github.com/VALKV-LABS/libvalkvedge", rev = "bfc93aa2f33ad36e3525e01b3eaf93c2dfdfdfc1" }
+valkvedge = { git = "https://github.com/VALKV-LABS/libvalkvedge", rev = "a978d61ed5e045081eaa2fb664de8a3a18079b52" }
 
 [build-dependencies]
 napi-build = "2"
