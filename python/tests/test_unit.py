@@ -4,6 +4,7 @@ import base64
 import json
 import time
 import unittest
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
 import edgekv
@@ -274,6 +275,32 @@ class ClientTests(unittest.TestCase):
         )
         with self.fails("BAD_REQUEST"):
             db.put("k", "v", if_version="v1", if_absent=True)
+        self.assertEqual(len(seen), 5)
+
+    def test_a_value_can_be_given_a_lifetime_and_reads_say_when_it_expires(self):
+        at = "2026-10-18T09:30:00.000Z"
+        kv, seen = client(
+            [
+                ok({"lsn": 1}),
+                ok({"lsn": 2}),
+                ok({"lsn": 3, "versions": ["v1"]}),
+                (200, {"x-edgekv-version": "v1", "x-edgekv-expires": at}, b"x"),
+                ok({"items": [{"key": b64("a"), "value": b64("x"), "version": "v1", "expires_at": at}], "next_page_token": None}),
+            ]
+        )
+        db = kv.database("sessions")
+        db.put("a", "x", ttl_seconds=3600)
+        self.assertEqual(parse_qs(seen[0]["url"].query), {"ttl_seconds": ["3600"]})
+        db.put("b", "x", expires_at=datetime(2026, 10, 18, 9, 30, tzinfo=timezone.utc), if_absent=True)
+        self.assertEqual(parse_qs(seen[1]["url"].query), {"expires_at": [at]})
+        self.assertEqual(seen[1]["headers"]["If-None-Match"], "*")
+        db.commit([{"op": "put", "key": "c", "value": "x", "ttl_seconds": 60}])
+        self.assertEqual(json.loads(seen[2]["body"])["ops"][0]["ttl_seconds"], 60)
+
+        self.assertEqual(db.get_versioned("a").expires_at, at)
+        self.assertEqual(next(db.scan()).expires_at, at)
+        with self.fails("BAD_REQUEST"):
+            db.put("d", "x", ttl_seconds=5, expires_at=at)
         self.assertEqual(len(seen), 5)
 
     def test_get_versioned_returns_the_version_sent_with_the_value(self):
