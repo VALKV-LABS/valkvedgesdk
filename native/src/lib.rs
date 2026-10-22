@@ -14,6 +14,7 @@ use napi::Status;
 use napi_derive::napi;
 use std::ops::Bound;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use valkvedge::{Durability, ValkvEdge, ValkvEdgeError, Version, WatchEvent, WriteOutcome};
 
 /// The application's token source, callable from any thread. Weak, so it
@@ -42,6 +43,18 @@ fn durability(value: Option<&str>) -> napi::Result<Option<Durability>> {
     }
 }
 
+/// Milliseconds since the Unix epoch, as JavaScript counts time.
+fn millis(at: SystemTime) -> i64 {
+    at.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// A 32-byte key, from its bytes.
+fn key_bytes(key: &[u8], what: &str) -> napi::Result<[u8; 32]> {
+    <[u8; 32]>::try_from(key)
+        .map_err(|_| invalid(format!("{what} must be 32 bytes, not {}", key.len())))
+}
+
 /// How to open a directory of databases.
 #[napi(object)]
 pub struct OpenOptions {
@@ -64,6 +77,8 @@ pub struct DatabaseOptions {
     pub encryption_key: Option<Buffer>,
     /// Keep no local copy: buffer writes, upload them, read from the service.
     pub ingest: Option<bool>,
+    /// Keep and follow only keys under these prefixes.
+    pub prefixes: Option<Vec<Buffer>>,
 }
 
 /// One page read from the service.
@@ -82,6 +97,8 @@ pub struct NativeOp {
     pub key: Buffer,
     /// The value of a put. Ignored for a delete.
     pub value: Option<Buffer>,
+    /// When the put's value expires, in milliseconds since the Unix epoch.
+    pub expires_ms: Option<i64>,
 }
 
 /// A requirement on one key for a conditional commit.
@@ -108,6 +125,9 @@ pub struct NativeCommit {
 pub struct NativeVersioned {
     pub value: Buffer,
     pub version: String,
+    /// When the value expires, in milliseconds since the Unix epoch. Absent
+    /// when it does not, or when read from the service.
+    pub expires_ms: Option<i64>,
 }
 
 /// One change reported by a watch.
@@ -125,6 +145,8 @@ pub struct NativeWatchEvent {
 pub struct NativeEntry {
     pub key: Buffer,
     pub value: Buffer,
+    /// As in [`NativeVersioned`].
+    pub expires_ms: Option<i64>,
 }
 
 /// Bounds for `scan`. With `prefix`, `start` and `end` must be unset.
@@ -241,19 +263,18 @@ impl NativeKv {
         name: String,
         options: Option<DatabaseOptions>,
     ) -> napi::Result<NativeDb> {
-        let (mode, key, ingest) = match options {
-            None => (None, None, false),
+        let (mode, key, ingest, prefixes) = match options {
+            None => (None, None, false, None),
             Some(o) => {
                 let key = match o.encryption_key {
                     None => None,
-                    Some(k) => Some(<[u8; 32]>::try_from(&k[..]).map_err(|_| {
-                        invalid(format!("encryptionKey must be 32 bytes, not {}", k.len()))
-                    })?),
+                    Some(k) => Some(key_bytes(&k, "encryptionKey")?),
                 };
                 (
                     durability(o.durability.as_deref())?,
                     key,
                     o.ingest.unwrap_or(false),
+                    o.prefixes,
                 )
             }
         };
@@ -271,6 +292,9 @@ impl NativeKv {
         }
         if let Some(k) = key {
             builder = builder.encryption_key(k);
+        }
+        if let Some(p) = prefixes {
+            builder = builder.prefixes(p.iter().map(|b| b.to_vec()));
         }
         Ok(NativeDb {
             db: builder.open().await.map_err(fail)?,
@@ -303,17 +327,23 @@ impl NativeDb {
         Ok(self.db.get(&key).map_err(fail)?.map(Buffer::from))
     }
 
-    /// Reads a key and the version of its value from the local copy.
+    /// Reads a key, the version of its value and when it expires, from the
+    /// local copy.
     #[napi]
     pub fn get_versioned(&self, key: Buffer) -> napi::Result<Option<NativeVersioned>> {
-        Ok(self
-            .db
-            .get_versioned(&key)
-            .map_err(fail)?
-            .map(|(value, version)| NativeVersioned {
-                value: value.into(),
-                version: version.to_string(),
-            }))
+        let Some((value, version)) = self.db.get_versioned(&key).map_err(fail)? else {
+            return Ok(None);
+        };
+        Ok(Some(NativeVersioned {
+            value: value.into(),
+            version: version.to_string(),
+            expires_ms: self.expires_ms(&key)?,
+        }))
+    }
+
+    /// When the value of `key` expires, from the local copy.
+    fn expires_ms(&self, key: &[u8]) -> napi::Result<Option<i64>> {
+        Ok(self.db.expires_at(key).map_err(fail)?.map(millis))
     }
 
     /// Reads a key and its version from the service, not the local copy.
@@ -327,6 +357,7 @@ impl NativeDb {
             .map(|(value, version)| NativeVersioned {
                 value: value.into(),
                 version: version.to_string(),
+                expires_ms: None,
             }))
     }
 
@@ -350,6 +381,7 @@ impl NativeDb {
                 .map(|(key, value)| NativeEntry {
                     key: key.into(),
                     value: value.into(),
+                    expires_ms: None,
                 })
                 .collect(),
             next_page_token: page.next_page_token,
@@ -400,9 +432,11 @@ impl NativeDb {
         let mut page = Vec::new();
         for item in self.db.range((lower, upper)).map_err(fail)?.take(limit) {
             let (key, value) = item.map_err(fail)?;
+            let expires_ms = self.expires_ms(&key)?;
             page.push(NativeEntry {
                 key: key.into(),
                 value: value.into(),
+                expires_ms,
             });
         }
         Ok(page)
@@ -424,7 +458,13 @@ impl NativeDb {
                 batch.delete(&op.key);
             } else {
                 let value = op.value.as_deref().unwrap_or_default();
-                batch.put(&op.key, value);
+                match op.expires_ms {
+                    None => batch.put(&op.key, value),
+                    Some(ms) => {
+                        let ms = u64::try_from(ms).unwrap_or(0);
+                        batch.put_expiring(&op.key, value, UNIX_EPOCH + Duration::from_millis(ms))
+                    }
+                };
             }
         }
         for condition in conditions.iter().flatten() {
@@ -448,6 +488,39 @@ impl NativeDb {
             outbox_seq: commit.outbox_seq.map(|s| s as i64),
             versions: commit.versions.iter().map(Version::to_string).collect(),
         })
+    }
+
+    /// The recovery key made when this process encrypted the database, as 64
+    /// hexadecimal characters, the first time it is asked for; `null` after,
+    /// or if it did not.
+    #[napi]
+    pub fn take_recovery_key(&self) -> Option<String> {
+        self.db.take_recovery_key()
+    }
+
+    /// The ids of the keys that open this database.
+    #[napi]
+    pub async fn key_ids(&self) -> napi::Result<Vec<String>> {
+        self.db.key_ids().await.map_err(fail)
+    }
+
+    /// Lets a 32-byte key open this database too. Returns its id.
+    #[napi]
+    pub async fn add_key(&self, key: Buffer) -> napi::Result<String> {
+        let key = key_bytes(&key, "key")?;
+        self.db.add_key(key).await.map_err(fail)
+    }
+
+    /// Makes a new random key that opens this database and returns it, once.
+    #[napi]
+    pub async fn add_recovery_key(&self) -> napi::Result<String> {
+        self.db.add_recovery_key().await.map_err(fail)
+    }
+
+    /// Stops the key with this id from opening the database.
+    #[napi]
+    pub async fn remove_key(&self, id: String) -> napi::Result<()> {
+        self.db.remove_key(&id).await.map_err(fail)
     }
 
     /// Pushes buffered writes and pulls what is new. Returns the local LSN.

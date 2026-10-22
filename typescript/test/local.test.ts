@@ -123,6 +123,88 @@ test('encrypted values need the key', async () => {
   await kv.close();
 });
 
+test('a value with a lifetime reports when it expires, and reads as not there once it has', async () => {
+  const kv = await LocalEdgeKV.open({ path: fresh() });
+  const db = await kv.database('sessions');
+  const before = Date.now();
+  await db.put('session/1', 'alive', { ttlSeconds: 3600 });
+  await db.putJson('session/2', { user: 7 }, { expiresAt: new Date(Date.now() + 60_000) });
+  await db.commit([{ op: 'put', key: 'session/3', value: 'gone', expiresAt: new Date(Date.now() - 1000).toISOString() }]);
+  await db.put('forever', 'kept');
+
+  const one = await db.getVersioned('session/1');
+  assert.equal(new TextDecoder().decode(one!.value), 'alive');
+  const at = one!.expiresAt!.getTime();
+  assert.ok(at >= before + 3_600_000 && at <= Date.now() + 3_600_000, `expires at ${one!.expiresAt!.toISOString()}`);
+  assert.deepEqual(await db.getJson('session/2'), { user: 7 });
+  assert.equal(await db.get('session/3'), null, 'already expired');
+  assert.equal((await db.getVersioned('forever'))!.expiresAt, undefined);
+
+  const scanned = [];
+  for await (const entry of db.scan()) scanned.push([entry.key, entry.expiresAt !== undefined]);
+  assert.deepEqual(scanned, [['forever', false], ['session/1', true], ['session/2', true]]);
+
+  // Writing the key again replaces the expiry.
+  await db.put('session/1', 'kept now');
+  assert.equal((await db.getVersioned('session/1'))!.expiresAt, undefined);
+
+  await rejectsWith(db.put('k', 'v', { ttlSeconds: 0 }), 'BAD_REQUEST');
+  await rejectsWith(db.put('k', 'v', { ttlSeconds: 1.5 }), 'BAD_REQUEST');
+  await rejectsWith(db.put('k', 'v', { ttlSeconds: 60, expiresAt: new Date() }), 'BAD_REQUEST');
+  await rejectsWith(db.put('k', 'v', { expiresAt: 'tomorrow' }), 'BAD_REQUEST');
+  await kv.close();
+});
+
+test('a new encrypted database gets a recovery key, and keys can be added and removed', async () => {
+  const path = fresh();
+  const key = crypto.getRandomValues(new Uint8Array(32));
+  let kv = await LocalEdgeKV.open({ path });
+  const db = await kv.database('vault', { encryptionKey: key });
+  await db.put('secret', 'hello');
+  const recovery = db.takeRecoveryKey();
+  assert.match(recovery!, /^[0-9a-f]{64}$/);
+  assert.equal(db.takeRecoveryKey(), null, 'given out once');
+  const [first, second] = await db.keyIds();
+  assert.equal((await db.keyIds()).length, 2);
+
+  const added = crypto.getRandomValues(new Uint8Array(32));
+  const addedId = await db.addKey(added);
+  assert.equal(await db.addKey(added), addedId, 'adding a key again changes nothing');
+  assert.deepEqual(await db.keyIds(), [first, second, addedId]);
+  const spare = await db.addRecoveryKey();
+  assert.match(spare, /^[0-9a-f]{64}$/);
+  await rejectsWith(db.addKey(new Uint8Array(16)), 'BAD_REQUEST');
+  await rejectsWith(db.removeKey('0000000000000000'), 'NOT_FOUND');
+  await db.removeKey(first!);
+  await kv.close();
+
+  // A fresh directory handle for each open, as the library remembers a key.
+  for (const opener of [recovery!, added, spare]) {
+    kv = await LocalEdgeKV.open({ path });
+    assert.equal(await (await kv.database('vault', { encryptionKey: opener })).getText('secret'), 'hello');
+    await kv.close();
+  }
+  kv = await LocalEdgeKV.open({ path });
+  await rejectsWith(kv.database('vault', { encryptionKey: key }), 'INVALID_ENCRYPTION_KEY');
+  await kv.close();
+
+  kv = await LocalEdgeKV.open({ path });
+  const reopened = await kv.database('vault', { encryptionKey: added });
+  assert.equal(reopened.takeRecoveryKey(), null, 'only the process that encrypted it has one');
+  for (const id of await reopened.keyIds()) if (id !== addedId) await reopened.removeKey(id);
+  await rejectsWith(reopened.removeKey(addedId), 'UNSUPPORTED');
+  const plain = await kv.database('plain');
+  assert.equal(plain.takeRecoveryKey(), null);
+  await rejectsWith(plain.keyIds(), 'UNSUPPORTED');
+  await kv.close();
+});
+
+test('a partial copy needs a service to follow', async () => {
+  const kv = await LocalEdgeKV.open({ path: fresh() });
+  await rejectsWith(kv.database('team', { prefixes: ['team/a/'] }), 'UNSUPPORTED');
+  await kv.close();
+});
+
 test('databases in a namespace are separate', async () => {
   const kv = await LocalEdgeKV.open({ path: fresh() });
   await (await kv.database('acme/orders')).put('k', 'acme');

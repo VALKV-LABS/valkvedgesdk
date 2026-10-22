@@ -934,6 +934,7 @@ export type {
   Durability,
   LocalOptions,
   LocalDatabaseOptions,
+  LocalPutOptions,
   LocalWriteResult,
   LocalScanOptions,
   LocalStatus,
