@@ -143,6 +143,26 @@ test('with an encryption key, the service only ever holds ciphertext', async () 
   assert.notEqual(raw.value, 'private: asthma');
 });
 
+test('an encrypted database gives the agent a recovery key that opens it on another server', async () => {
+  const service = new FakeService(['memory']);
+  const { call, tools } = await connect(service, { database: 'memory', encryptionKey: KEY });
+  assert.ok((await tools()).includes('create_recovery_key'));
+  await call('put', { key: 'facts/name', value: 'private: Ada' });
+  const made = await call('create_recovery_key');
+  assert.match(made.recovery_key, /^[0-9a-f]{64}$/);
+  assert.equal(made.key_count, 2, 'its key and the recovery key');
+  assert.match(made.store_it, /once/);
+  // Asked again: another one, not the same.
+  const again = await call('create_recovery_key');
+  assert.notEqual(again.recovery_key, made.recovery_key);
+  assert.equal(again.key_count, 3);
+
+  const recovered = await connect(service, { database: 'memory', encryptionKey: made.recovery_key });
+  assert.equal((await recovered.call('get', { key: 'facts/name' })).value, 'private: Ada');
+  const instructions = (await connect(service, { database: 'memory', encryptionKey: KEY })).client.getInstructions()!;
+  assert.match(instructions, /create_recovery_key/);
+});
+
 test('without an encryption key, values are stored as sent', async () => {
   const service = new FakeService(['memory']);
   const { call } = await connect(service, { database: 'memory' });

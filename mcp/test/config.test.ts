@@ -52,3 +52,19 @@ test('every problem is reported at once', () => {
   );
   assert.throws(() => configFromEnv({}), /EDGEKV_API_KEY is missing/);
 });
+
+test('the encryption key can be read from a file, so it stays out of the host configuration', () => {
+  const files: Record<string, string> = { '/run/secrets/key': `${'cd'.repeat(32)}\n`, '/run/secrets/bad': 'short' };
+  const read = (path: string) => {
+    const text = files[path];
+    if (text === undefined) throw new Error(`ENOENT: no such file, open '${path}'`);
+    return text;
+  };
+  assert.equal(configFromEnv({ ...minimal, EDGEKV_ENCRYPTION_KEY_FILE: '/run/secrets/key' }, read).encryptionKey, 'cd'.repeat(32));
+  assert.throws(() => configFromEnv({ ...minimal, EDGEKV_ENCRYPTION_KEY_FILE: '/nope' }, read), /could not be read: ENOENT/);
+  assert.throws(() => configFromEnv({ ...minimal, EDGEKV_ENCRYPTION_KEY_FILE: '/run/secrets/bad' }, read), /the key in EDGEKV_ENCRYPTION_KEY_FILE/);
+  assert.throws(
+    () => configFromEnv({ ...minimal, EDGEKV_ENCRYPTION_KEY: 'ab'.repeat(32), EDGEKV_ENCRYPTION_KEY_FILE: '/run/secrets/key' }, read),
+    /not both/,
+  );
+});

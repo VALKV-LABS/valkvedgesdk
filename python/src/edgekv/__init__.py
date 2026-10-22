@@ -23,10 +23,19 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
-from ._crypto import ENCRYPTION_OVERHEAD, ValueCipher
+from ._crypto import (
+    ENCRYPTION_OVERHEAD,
+    ValueCipher,
+    encryption_key_bytes,
+    key_id,
+    new_key,
+    unwrap_data_key,
+    wrap_data_key,
+)
 
 __all__ = [
     "ENCRYPTION_OVERHEAD",
+    "key_id",
     "EdgeKV",
     "Database",
     "Databases",
@@ -380,29 +389,143 @@ class _Client:
 class Database:
     """One database's contents. Get one from :meth:`EdgeKV.database`."""
 
-    def __init__(self, client: _Client, name: str, cipher: Optional[ValueCipher] = None) -> None:
+    def __init__(self, client: _Client, name: str, key: Optional[bytes] = None) -> None:
         self._client = client
-        self._cipher = cipher
+        self._key = key
+        #: The cipher for the data key ``_key`` opens, once found.
+        self._cipher: Optional[ValueCipher] = None
+        #: The recovery key made when this client encrypted the database, until taken.
+        self._recovery: Optional[str] = None
+        self._lock = threading.Lock()
         #: The database's name within the account.
         self.name = name
 
     @property
     def encrypted(self) -> bool:
         """True if values are encrypted here before they are sent."""
-        return self._cipher is not None
+        return self._key is not None
 
     def _path(self, rest: str) -> str:
         return f"/v1/db/{urllib.parse.quote(self.name, safe='')}{rest}"
 
+    def _key_state(self) -> Dict[str, Any]:
+        return self._client.send_json("GET", self._path("/keys"))
+
+    def _put_slots(self, expected: List[Dict[str, str]], slots: List[Dict[str, str]]) -> None:
+        self._client.send_json("PUT", self._path("/keys"), json_body={"expected": expected, "slots": slots})
+
+    def _ready(self) -> Optional[ValueCipher]:
+        """The cipher for this database's data key, found once."""
+        if self._key is None or self._cipher is not None:
+            return self._cipher
+        with self._lock:
+            if self._cipher is None:
+                self._resolve(self._key)
+        return self._cipher
+
+    def _resolve(self, key: bytes) -> None:
+        # Values are sealed with the database's data key; each of its keys
+        # holds a copy of it in a key slot the service keeps. A new database
+        # gets a random data key and two slots: this key's and a new recovery
+        # key's. One encrypted before key slots has none: its key is its data key.
+        for _ in range(2):
+            state = self._key_state()
+            slots = state.get("slots") or []
+            if slots:
+                data_key = unwrap_data_key(slots, key, self.name)
+                if data_key is None:
+                    raise EdgeKVError("INVALID_ENCRYPTION_KEY", "this key is not one of the database's keys", 0)
+                self._cipher = ValueCipher(data_key, self.name)
+                return
+            if int(state.get("lsn") or 0) > 0:
+                self._cipher = ValueCipher(key, self.name)
+                return
+            data_key = bytes.fromhex(new_key())
+            recovery = new_key()
+            new = [wrap_data_key(data_key, key, self.name), wrap_data_key(data_key, recovery, self.name)]
+            try:
+                self._put_slots([], new)
+            except EdgeKVError as error:
+                if error.code == "CONDITION_FAILED":
+                    continue  # another client encrypted it first: read its slots
+                raise
+            self._recovery = recovery
+            self._cipher = ValueCipher(data_key, self.name)
+            return
+        raise EdgeKVError("UNAVAILABLE", "the database's keys kept changing while they were read", 0)
+
+    def _require_key(self) -> ValueCipher:
+        cipher = self._ready()
+        if cipher is None:
+            raise EdgeKVError("UNSUPPORTED", "this database was not given an encryption key", 0)
+        return cipher
+
+    def take_recovery_key(self) -> Optional[str]:
+        """The recovery key made when this client encrypted a new database, the
+        first time it is asked for, as 64 hexadecimal characters; ``None``
+        after, or if this client did not make the database. It opens the
+        database like any of its keys. Store it where you keep secrets: if
+        every key is lost, the data cannot be recovered, by anyone."""
+        self._ready()
+        recovery, self._recovery = self._recovery, None
+        return recovery
+
+    def key_ids(self) -> List[str]:
+        """The ids of the keys that open this database."""
+        cipher = self._require_key()
+        slots = self._key_state().get("slots") or []
+        return [s["id"] for s in slots] if slots else [key_id(cipher.data_key)]
+
+    def add_key(self, key: Union[bytes, str]) -> str:
+        """Lets ``key`` open this database too, and returns its id. Nothing is
+        encrypted again. Needs an API key: an access token cannot change keys."""
+        cipher = self._require_key()
+        ident = key_id(key)
+        current = self._key_state().get("slots") or []
+        if any(s["id"] == ident for s in current):
+            return ident
+        slots = list(current)
+        if not slots:
+            # Encrypted before key slots: its key is its data key, and gets the first slot.
+            slots.append(wrap_data_key(cipher.data_key, cipher.data_key, self.name))
+        slots.append(wrap_data_key(cipher.data_key, key, self.name))
+        self._put_slots(current, slots)
+        return ident
+
+    def add_recovery_key(self) -> str:
+        """Makes a new random key that opens this database, and returns it once.
+        Store it where you keep secrets."""
+        key = new_key()
+        self.add_key(key)
+        return key
+
+    def remove_key(self, ident: str) -> None:
+        """Stops the key with this id from opening the database. The last key
+        cannot be removed."""
+        self._require_key()
+        current = self._key_state().get("slots") or []
+        if not current:
+            raise EdgeKVError("UNSUPPORTED", "this database has no key slots yet: add a key first", 0)
+        slots = [s for s in current if s["id"] != ident]
+        if len(slots) == len(current):
+            raise EdgeKVError("NOT_FOUND", f"key {ident} not found", 404)
+        if not slots:
+            raise EdgeKVError(
+                "UNSUPPORTED", "a database keeps at least one key: add another before removing this one", 0
+            )
+        self._put_slots(current, slots)
+
     def _sealed(self, key: bytes, value: bytes) -> bytes:
         """The value to send for ``key``: encrypted when there is a key."""
-        return value if self._cipher is None else self._cipher.seal(key, value)
+        cipher = self._ready()
+        return value if cipher is None else cipher.seal(key, value)
 
     def _opened(self, key: bytes, stored: bytes) -> bytes:
         """The value as read for ``key``: decrypted when there is a key."""
-        if self._cipher is None:
+        cipher = self._ready()
+        if cipher is None:
             return stored
-        value = self._cipher.open(key, stored)
+        value = cipher.open(key, stored)
         if value is None:
             raise EdgeKVError(
                 "INVALID_ENCRYPTION_KEY",
@@ -765,24 +888,26 @@ class EdgeKV:
             decrypted when read: the service stores only ciphertext. The format
             is the one local replicas use, so they read these values with the
             same key, and this reads theirs. Keys (the names) are not
-            encrypted. A lost key cannot be recovered. Without it, values are
-            sent as they are. Use one choice per database: reading a value
-            written without the key, or with another key, raises
-            ``INVALID_ENCRYPTION_KEY``. Needs ``pip install "valkv-edgekv[encryption]"``.
+            encrypted. Without it, values are sent as they are. The key must be
+            one of the database's keys (:meth:`Database.add_key`); a new
+            encrypted database also gets a recovery key, given out once by
+            :meth:`Database.take_recovery_key`. If every key is lost, the data
+            cannot be recovered, by anyone. Needs ``pip install "valkv-edgekv[encryption]"``.
         """
-        cipher = None
+        key = None
         if encryption_key is not None:
             try:
-                cipher = ValueCipher(encryption_key, name)
+                ValueCipher(encryption_key, name)
+                key = encryption_key_bytes(encryption_key)
             except (ValueError, ImportError) as error:
                 raise EdgeKVError("BAD_REQUEST", str(error), 0) from None
         if self._tokens is None:
-            return Database(self._data, name, cipher)
+            return Database(self._data, name, key)
         with self._caches_lock:
             cache = self._caches.get(name)
             if cache is None:
                 cache = self._caches[name] = _TokenCache(self._tokens, name)
-        return Database(self._data.with_credential(cache), name, cipher)
+        return Database(self._data.with_credential(cache), name, key)
 
     def regions(self) -> List[str]:
         """Regions a database can be created in."""

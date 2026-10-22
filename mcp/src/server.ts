@@ -74,6 +74,11 @@ function instructions(config: Config): string {
       ? '- Values are encrypted before they leave this machine. Key names are not: keep secrets out of them.'
       : '- Values are stored as sent, not encrypted by this server. Keep secrets out of keys and values.',
   );
+  if (config.encryptionKey && !config.readOnly) {
+    lines.push(
+      '- Only the encryption key can read this memory. Before relying on it, call create_recovery_key once and give the result to the user to keep: if the key is lost without one, the memory is gone.',
+    );
+  }
   return lines.join('\n');
 }
 
@@ -187,6 +192,29 @@ export function createServer(kv: EdgeKV, config: Config): McpServer {
           return { written: args.entries.length, versions: result.versions, lsn: result.lsn };
         }),
     );
+
+    if (config.encryptionKey) {
+      server.registerTool(
+        'create_recovery_key',
+        {
+          title: 'Make a recovery key',
+          description:
+            'Returns a key that opens this encrypted database, as 64 hexadecimal characters, shown only this once. It works in place of the encryption key this server uses. Give it to the user, or store it with your secrets: if every key is lost, the database cannot be read again, by anyone. A new database made by this server already has one, which this returns the first time it is called.',
+          inputSchema: { ...database },
+          annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        },
+        (args: WithDatabase) =>
+          run(async () => {
+            const db = open(args.database);
+            const recovery = (await db.takeRecoveryKey()) ?? (await db.addRecoveryKey());
+            return {
+              recovery_key: recovery,
+              key_count: (await db.keyIds()).length,
+              store_it: 'Shown once. Store it where secrets are kept, apart from the encryption key.',
+            };
+          }),
+      );
+    }
 
     if (config.allowDelete) {
       server.registerTool(

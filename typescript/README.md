@@ -124,9 +124,29 @@ keep secrets out of key names. Each value grows by `ENCRYPTION_OVERHEAD` (28 byt
 The format is the one the local mode and the Rust library use: a `LocalEdgeKV`
 replica opened with the same key reads these values, and this reads theirs.
 
-Choose per database, not per write: a database is either encrypted, always with the
-same key, or not at all. Reading a value written without the key, or with another key,
-fails with `INVALID_ENCRYPTION_KEY`.
+Choose per database, not per write: a database is either encrypted or not at all.
+Reading a value written without a key fails with `INVALID_ENCRYPTION_KEY`.
+
+**Recovery and more keys.** Values are sealed with the database's data key, and each of
+its keys holds a copy of it in a key slot the service keeps (it reveals nothing without
+the key). Any one key opens the database:
+
+```ts
+const recovery = await vault.takeRecoveryKey()   // a new database's recovery key, once
+// store it where you keep secrets, apart from VAULT_KEY
+
+await vault.addKey(otherKey)                     // another key opens it too
+const spare = await vault.addRecoveryKey()       // or a random one, returned once
+await vault.removeKey(keyId(oldKey))             // stop a key from opening it
+await vault.keyIds()
+```
+
+Nothing is encrypted again when keys change. The last key cannot be removed. If every
+key is lost, the data cannot be recovered, by anyone, including the service. Changing
+keys needs an API key, not an access token. A database encrypted before key slots
+opens with its one key as before, and gets slots when a key is added; that first key
+then keeps reading values already written even if its slot is removed. All clients of
+an encrypted database need this version or later.
 
 ### Waiting for changes
 

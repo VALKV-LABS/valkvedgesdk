@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+
 /** The server's settings, from environment variables. */
 export interface Config {
   /** `EDGEKV_API_KEY`: an API key from the portal, `ekv_…`. */
@@ -11,9 +13,11 @@ export interface Config {
   /** `EDGEKV_REGION`: where `create_database` puts a database. Default: the first region the service offers. */
   region?: string;
   /**
-   * `EDGEKV_ENCRYPTION_KEY`: 64 hexadecimal characters. Values are encrypted
-   * with it before they leave this process, so the service stores only
-   * ciphertext. Without it, values are sent as they are.
+   * `EDGEKV_ENCRYPTION_KEY`, or the contents of the file named by
+   * `EDGEKV_ENCRYPTION_KEY_FILE`: 64 hexadecimal characters. Values are
+   * encrypted with it before they leave this process, so the service stores
+   * only ciphertext. Without it, values are sent as they are. A file keeps
+   * the key out of the MCP host's configuration, which is often plain text.
    */
   encryptionKey?: string;
   /** `EDGEKV_READ_ONLY=1`: only the tools that read. */
@@ -25,7 +29,10 @@ export interface Config {
 const yes = (value: string | undefined) => value !== undefined && /^(1|true|yes|on)$/i.test(value.trim());
 
 /** The settings, or every problem with them, one per line. */
-export function configFromEnv(env: Record<string, string | undefined>): Config {
+export function configFromEnv(
+  env: Record<string, string | undefined>,
+  readFile: (path: string) => string = (path) => readFileSync(path, 'utf8'),
+): Config {
   const problems: string[] = [];
   const text = (name: string) => {
     const value = env[name]?.trim();
@@ -39,9 +46,21 @@ export function configFromEnv(env: Record<string, string | undefined>): Config {
   const url = text('EDGEKV_URL');
   if (!url) problems.push('EDGEKV_URL is missing: where the data API is, for example https://api.example.com');
 
-  const encryptionKey = text('EDGEKV_ENCRYPTION_KEY');
+  let encryptionKey = text('EDGEKV_ENCRYPTION_KEY');
+  const keyFile = text('EDGEKV_ENCRYPTION_KEY_FILE');
+  if (encryptionKey !== undefined && keyFile !== undefined) {
+    problems.push('set EDGEKV_ENCRYPTION_KEY or EDGEKV_ENCRYPTION_KEY_FILE, not both');
+  } else if (keyFile !== undefined) {
+    try {
+      encryptionKey = readFile(keyFile).trim();
+    } catch (error) {
+      problems.push(`EDGEKV_ENCRYPTION_KEY_FILE could not be read: ${(error as Error).message}`);
+    }
+  }
   if (encryptionKey !== undefined && !/^[0-9a-fA-F]{64}$/.test(encryptionKey)) {
-    problems.push('EDGEKV_ENCRYPTION_KEY must be 64 hexadecimal characters (32 bytes); make one with: openssl rand -hex 32');
+    problems.push(
+      `${keyFile !== undefined ? 'the key in EDGEKV_ENCRYPTION_KEY_FILE' : 'EDGEKV_ENCRYPTION_KEY'} must be 64 hexadecimal characters (32 bytes); make one with: openssl rand -hex 32`,
+    );
   }
 
   const database = text('EDGEKV_DATABASE');

@@ -1,7 +1,7 @@
 // Tests of the client against a stand-in for `fetch`. No network.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ValueCipher, encryptionKeyBytes } from '../src/crypto.js';
+import { ValueCipher, encryptionKeyBytes, keyId, unwrapDataKey, wrapDataKey } from '../src/crypto.js';
 import { ENCRYPTION_OVERHEAD, EdgeKV, EdgeKVError, UPDATE_ATTEMPTS, tokenRefreshAt, type TokenSource } from '../src/index.js';
 
 interface Seen {
@@ -469,15 +469,22 @@ test('an encryption key is 32 bytes or 64 hexadecimal characters', () => {
   }
 });
 
+/**
+ * What `GET /keys` answers for a database encrypted before key slots: none,
+ * and it holds data. Its key is its data key, so values are sealed with it.
+ */
+const BEFORE_SLOTS = { json: { slots: [], lsn: 5 } };
+
 test('with a key, put sends ciphertext and get returns the value', async () => {
-  const { kv, seen } = client([{ json: { lsn: 1 } }]);
+  const { kv, seen } = client([BEFORE_SLOTS, { json: { lsn: 1 } }]);
   const db = kv.database(VECTOR.database, { encryptionKey: KEY });
   await db.put(VECTOR.key, VECTOR.value);
-  const sent = seen[0]!.body as Uint8Array;
+  assert.equal(seen[0]!.url.pathname, '/v1/db/agent-memory/keys');
+  const sent = seen[1]!.body as Uint8Array;
   assert.equal(sent.length, VECTOR.value.length + ENCRYPTION_OVERHEAD);
   assert.ok(!Buffer.from(sent).includes(Buffer.from(VECTOR.value)), 'the value is not sent in clear');
 
-  const { kv: reader } = client([{ bytes: sent }, { bytes: Buffer.from(VECTOR.sealed, 'hex') }]);
+  const { kv: reader } = client([BEFORE_SLOTS, { bytes: sent }, { bytes: Buffer.from(VECTOR.sealed, 'hex') }]);
   const same = reader.database(VECTOR.database, { encryptionKey: KEY_HEX });
   assert.equal(await same.getText(VECTOR.key), VECTOR.value);
   assert.equal(await same.getText(VECTOR.key), VECTOR.value, 'a value sealed by another client opens');
@@ -485,7 +492,7 @@ test('with a key, put sends ciphertext and get returns the value', async () => {
 
 test('with the wrong key, or a value that was not encrypted, reads fail with INVALID_ENCRYPTION_KEY', async () => {
   const sealed = Buffer.from(VECTOR.sealed, 'hex');
-  const { kv } = client([{ bytes: sealed }, { bytes: bytes('plain text') }, { bytes: sealed }]);
+  const { kv } = client([BEFORE_SLOTS, { bytes: sealed }, BEFORE_SLOTS, { bytes: bytes('plain text') }, { bytes: sealed }]);
   const wrongKey = kv.database(VECTOR.database, { encryptionKey: OTHER_KEY });
   await assert.rejects(wrongKey.get(VECTOR.key), (error: EdgeKVError) => {
     assert.equal(error.code, 'INVALID_ENCRYPTION_KEY');
@@ -498,21 +505,26 @@ test('with the wrong key, or a value that was not encrypted, reads fail with INV
 });
 
 test('with a key, commits seal each value under its own key, and scans open them', async () => {
-  const { kv, seen } = client([{ json: { lsn: 2 } }]);
+  const { kv, seen } = client([BEFORE_SLOTS, { json: { lsn: 2 } }]);
   const db = kv.database('memory', { encryptionKey: KEY });
   await db.commit([
     { op: 'put', key: 'facts/a', value: 'one' },
     { op: 'put', key: 'facts/b', value: 'two' },
     { op: 'delete', key: 'facts/c' },
   ]);
-  const ops = (JSON.parse(seen[0]!.body as string) as { ops: { op: string; key: string; value?: string }[] }).ops;
+  const ops = (JSON.parse(seen[1]!.body as string) as { ops: { op: string; key: string; value?: string }[] }).ops;
   assert.deepEqual(ops[2], { op: 'delete', key: b64('facts/c') });
 
   const items = [
     { key: ops[0]!.key, value: ops[0]!.value!, version: 'v1' },
     { key: ops[1]!.key, value: ops[1]!.value!, version: 'v2' },
   ];
-  const { kv: reader } = client([{ json: { items, next_page_token: null } }, { json: { items: [{ ...items[0]!, key: b64('facts/b') }], next_page_token: null } }]);
+  const { kv: reader } = client([
+    BEFORE_SLOTS,
+    { json: { items, next_page_token: null } },
+    BEFORE_SLOTS,
+    { json: { items: [{ ...items[0]!, key: b64('facts/b') }], next_page_token: null } },
+  ]);
   const listed = [];
   for await (const entry of reader.database('memory', { encryptionKey: KEY }).scan({ prefix: 'facts/' })) {
     listed.push([entry.key, new TextDecoder().decode(entry.value), entry.version]);
@@ -528,10 +540,79 @@ test('with a key, commits seal each value under its own key, and scans open them
 test('update reads, decrypts, and writes back sealed under the version it read', async () => {
   const cipher = new ValueCipher(KEY, 'counters');
   const { kv, seen } = client([
+    BEFORE_SLOTS,
     { bytes: cipher.seal(bytes('hits'), bytes('41')), headers: { 'x-edgekv-version': 'v7' } },
     { json: { lsn: 8 } },
   ]);
   await kv.database('counters', { encryptionKey: KEY }).update('hits', (current) => String(Number(new TextDecoder().decode(current!)) + 1));
-  assert.equal(seen[1]!.headers['if-match'], 'v7');
-  assert.deepEqual(cipher.open(bytes('hits'), seen[1]!.body as Uint8Array), bytes('42'));
+  assert.equal(seen[2]!.headers['if-match'], 'v7');
+  assert.deepEqual(cipher.open(bytes('hits'), seen[2]!.body as Uint8Array), bytes('42'));
+});
+
+/** A key id and a key slot computed by an independent implementation; the library checks the same. */
+const SLOT_VECTOR = {
+  id: '4110f1a6725b07a0',
+  wrapped:
+    'a0a1a2a3a4a5a6a7a8a9aaabdc7aaa8c9933147a78d629cf202723244d8f016c97bfb6746c01016aadbf1dd32457e5dff8609a792135357656d81992',
+  dataKey: Uint8Array.from({ length: 32 }, (_, i) => 0xd0 + (i % 16)),
+};
+
+test('key ids and key slots are in the library format', () => {
+  assert.equal(keyId(KEY), SLOT_VECTOR.id);
+  assert.equal(keyId(KEY_HEX), SLOT_VECTOR.id);
+  const slot = { id: SLOT_VECTOR.id, wrapped: SLOT_VECTOR.wrapped };
+  assert.deepEqual(unwrapDataKey([slot], KEY, 'agent-memory'), SLOT_VECTOR.dataKey);
+  assert.equal(unwrapDataKey([slot], KEY, 'other-db'), null);
+  assert.equal(unwrapDataKey([slot], OTHER_KEY, 'agent-memory'), null);
+  const made = wrapDataKey(SLOT_VECTOR.dataKey, OTHER_KEY, 'agent-memory');
+  assert.deepEqual(unwrapDataKey([slot, made], OTHER_KEY, 'agent-memory'), SLOT_VECTOR.dataKey);
+});
+
+test('a new encrypted database gets a data key and a recovery key that opens it', async () => {
+  const { kv, seen } = client([{ json: { slots: [], lsn: 0 } }, { json: {} }, { json: { lsn: 1 } }]);
+  const db = kv.database('vault', { encryptionKey: KEY });
+  await db.put('pin', '1234');
+  assert.deepEqual([seen[1]!.method, seen[1]!.url.pathname], ['PUT', '/v1/db/vault/keys']);
+  const sentSlots = JSON.parse(seen[1]!.body as string) as { expected: unknown[]; slots: { id: string; wrapped: string }[] };
+  assert.deepEqual(sentSlots.expected, []);
+  const recovery = await db.takeRecoveryKey();
+  assert.match(recovery!, /^[0-9a-f]{64}$/);
+  assert.equal(await db.takeRecoveryKey(), null, 'given out once');
+  assert.deepEqual(
+    sentSlots.slots.map((s) => s.id),
+    [keyId(KEY), keyId(recovery!)],
+  );
+
+  // Another client opens it with the recovery key alone.
+  const dataKey = unwrapDataKey(sentSlots.slots, KEY, 'vault')!;
+  const sealed = new ValueCipher(dataKey, 'vault').seal(bytes('pin'), bytes('1234'));
+  const { kv: other } = client([{ json: { slots: sentSlots.slots, lsn: 1 } }, { bytes: sealed }]);
+  assert.equal(await other.database('vault', { encryptionKey: recovery! }).getText('pin'), '1234');
+  // A key that is not one of them is refused before anything is read.
+  const { kv: stranger } = client([{ json: { slots: sentSlots.slots, lsn: 1 } }]);
+  await assert.rejects(stranger.database('vault', { encryptionKey: OTHER_KEY }).get('pin'), { code: 'INVALID_ENCRYPTION_KEY' });
+});
+
+test('keys are added and removed against the slots as last read', async () => {
+  const dataKey = SLOT_VECTOR.dataKey;
+  const mine = wrapDataKey(dataKey, KEY, 'vault');
+  const { kv, seen } = client([
+    { json: { slots: [mine], lsn: 3 } },
+    { json: { slots: [mine], lsn: 3 } },
+    { json: {} },
+    { json: { slots: [mine], lsn: 3 } },
+  ]);
+  const db = kv.database('vault', { encryptionKey: KEY });
+  assert.equal(await db.addKey(OTHER_KEY), keyId(OTHER_KEY));
+  const put = JSON.parse(seen[2]!.body as string) as { expected: unknown[]; slots: { id: string }[] };
+  assert.deepEqual(put.expected, [mine]);
+  assert.deepEqual(
+    put.slots.map((s) => s.id),
+    [keyId(KEY), keyId(OTHER_KEY)],
+  );
+  // As last read, it is the only key: it stays.
+  await assert.rejects(db.removeKey(keyId(KEY)), { code: 'UNSUPPORTED' });
+  assert.equal(seen.length, 4);
+  const { kv: plain } = client([]);
+  await assert.rejects(plain.database('p').addKey(KEY), { code: 'UNSUPPORTED' });
 });
