@@ -18,6 +18,8 @@ export class FakeService {
   readonly regions = ['us-west-2', 'eu-west-1'];
   /** Every request, as `METHOD /path`. */
   readonly requests: string[] = [];
+  /** Database name to its key slots, as the service keeps them. */
+  readonly keySlots = new Map<string, unknown[]>();
   private lsn = 0;
 
   constructor(names: string[] = []) {
@@ -53,6 +55,16 @@ export class FakeService {
     const keys = this.databases.get(decodeURIComponent(match[1]!));
     if (!keys) return failure(404, 'NOT_FOUND', 'database not found');
     const rest = match[2]!;
+    const name = decodeURIComponent(match[1]!);
+
+    if (rest === '/keys') {
+      const slots = this.keySlots.get(name) ?? [];
+      if (method === 'GET') return json(200, { slots, lsn: keys.size > 0 ? this.lsn : 0 });
+      const sent = JSON.parse(String(body)) as { expected: unknown[]; slots: unknown[] };
+      if (JSON.stringify(sent.expected) !== JSON.stringify(slots)) return failure(412, 'CONDITION_FAILED', 'the key slots changed');
+      this.keySlots.set(name, sent.slots);
+      return json(200, {});
+    }
 
     if (rest === '/commit') {
       const { ops } = JSON.parse(String(body)) as { ops: { op: string; key: string; value?: string }[] };

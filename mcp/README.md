@@ -66,6 +66,7 @@ Use the addresses shown in your portal.
 | `EDGEKV_URL` | Required. Where the data API is |
 | `EDGEKV_DATABASE` | Use only this database; the tools then take no database name. Recommended |
 | `EDGEKV_ENCRYPTION_KEY` | 64 hexadecimal characters. Values are encrypted before they are sent. Without it, values are sent as they are |
+| `EDGEKV_ENCRYPTION_KEY_FILE` | Instead of `EDGEKV_ENCRYPTION_KEY`: a file holding the key, so it is not written in the MCP host's configuration |
 | `EDGEKV_CONTROL_URL` | Where databases are managed. With it, and without `EDGEKV_DATABASE`, the agent can list and create databases (the key must be allowed to manage databases) |
 | `EDGEKV_REGION` | Where `create_database` puts a database. Default: the first region offered |
 | `EDGEKV_READ_ONLY` | `1`: only the tools that read |
@@ -83,6 +84,7 @@ naming every problem.
 | `put` | Writes a key. With `if_version`, only if nobody changed it since it was read; with `if_absent`, only if it is new | Not read-only |
 | `put_many` | Writes several keys as one write: all or none | Not read-only |
 | `delete` | Removes a key | `EDGEKV_ALLOW_DELETE=1` |
+| `create_recovery_key` | Returns a key that opens the encrypted database, shown once | An encryption key, not read-only |
 | `list_databases`, `create_database` | Manage databases, for example one per user | `EDGEKV_CONTROL_URL`, no `EDGEKV_DATABASE` |
 
 Values are text; the agent is told to use JSON for anything structured. A value that is
@@ -101,8 +103,15 @@ const memory = new EdgeKV({ apiKey, url }).database('agent-memory', { encryption
 ```
 
 Key names are not encrypted: keep secrets out of them. Use one choice per database:
-always the same key, or never one. Reading a value written without the key, or with
-another key, fails with `INVALID_ENCRYPTION_KEY`.
+encrypted or not. Reading a value written without a key fails with
+`INVALID_ENCRYPTION_KEY`.
+
+**Only a key can read the memory.** If the encryption key is lost, and there is no
+recovery key, the memory is gone: nobody, including the service, can read it. The
+server tells the agent to call `create_recovery_key` once and hand the result to you.
+Store it where you keep secrets; any recovery key works as `EDGEKV_ENCRYPTION_KEY` on
+another server. Keep the key itself out of plain-text configuration with
+`EDGEKV_ENCRYPTION_KEY_FILE`.
 
 ## Cost
 

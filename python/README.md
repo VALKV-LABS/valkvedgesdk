@@ -112,9 +112,29 @@ The format is the one local replicas use (the Rust library, and the TypeScript
 package's local mode): a replica opened with the same key reads these values, and this
 reads theirs.
 
-Choose per database, not per write: a database is either encrypted, always with the
-same key, or not at all. Reading a value written without the key, or with another key,
-raises `INVALID_ENCRYPTION_KEY`.
+Choose per database, not per write: a database is either encrypted or not at all.
+Reading a value written without a key raises `INVALID_ENCRYPTION_KEY`.
+
+**Recovery and more keys.** Values are sealed with the database's data key, and each of
+its keys holds a copy of it in a key slot the service keeps (it reveals nothing without
+the key). Any one key opens the database:
+
+```python
+recovery = vault.take_recovery_key()      # a new database's recovery key, once
+# store it where you keep secrets, apart from VAULT_KEY
+
+vault.add_key(other_key)                  # another key opens it too
+spare = vault.add_recovery_key()          # or a random one, returned once
+vault.remove_key(edgekv.key_id(old_key))  # stop a key from opening it
+vault.key_ids()
+```
+
+Nothing is encrypted again when keys change. The last key cannot be removed. If every
+key is lost, the data cannot be recovered, by anyone, including the service. Changing
+keys needs an API key, not an access token. A database encrypted before key slots
+opens with its one key as before, and gets slots when a key is added; that first key
+then keeps reading values already written even if its slot is removed. All clients of
+an encrypted database need this version or later.
 
 ### Waiting for changes
 

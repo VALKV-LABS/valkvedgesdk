@@ -480,6 +480,11 @@ VECTOR = {
 }
 
 
+#: What `GET /keys` answers for a database encrypted before key slots: none,
+#: and it holds data. Its key is its data key, so values are sealed with it.
+BEFORE_SLOTS = ok({"slots": [], "lsn": 5})
+
+
 @unittest.skipUnless(HAVE_CRYPTOGRAPHY, 'needs pip install "valkv-edgekv[encryption]"')
 class EncryptionTests(unittest.TestCase):
     def fails(self, code, status=None):
@@ -511,19 +516,22 @@ class EncryptionTests(unittest.TestCase):
                 kv.database("a", encryption_key=wrong)
 
     def test_with_a_key_put_sends_ciphertext_and_get_returns_the_value(self):
-        kv, seen = client([ok({"lsn": 1})])
+        kv, seen = client([BEFORE_SLOTS, ok({"lsn": 1})])
         kv.database(VECTOR["database"], encryption_key=KEY).put("facts/name", "Ada Lovelace")
-        sent = seen[0]["body"]
+        self.assertEqual(seen[0]["url"].path, "/v1/db/agent-memory/keys")
+        sent = seen[1]["body"]
         self.assertEqual(len(sent), len(VECTOR["value"]) + edgekv.ENCRYPTION_OVERHEAD)
         self.assertNotIn(VECTOR["value"], sent)
 
-        reader, _ = client([(200, {}, sent), (200, {}, VECTOR["sealed"])])
+        reader, _ = client([(200, {}, sent), BEFORE_SLOTS, (200, {}, VECTOR["sealed"])])
         same = reader.database(VECTOR["database"], encryption_key=KEY.hex())
         self.assertEqual(same.get_text("facts/name"), "Ada Lovelace")
         self.assertEqual(same.get_text("facts/name"), "Ada Lovelace", "a value sealed by another client opens")
 
     def test_the_wrong_key_or_a_value_that_was_not_encrypted_fails_with_invalid_encryption_key(self):
-        kv, _ = client([(200, {}, VECTOR["sealed"]), (200, {}, b"plain text"), (200, {}, VECTOR["sealed"])])
+        kv, _ = client(
+            [(200, {}, VECTOR["sealed"]), BEFORE_SLOTS, (200, {}, b"plain text"), BEFORE_SLOTS, (200, {}, VECTOR["sealed"])]
+        )
         with self.fails("INVALID_ENCRYPTION_KEY") as failed:
             kv.database(VECTOR["database"], encryption_key=OTHER_KEY).get("facts/name")
         self.assertEqual(failed.error.key, b"facts/name")
@@ -533,7 +541,7 @@ class EncryptionTests(unittest.TestCase):
         self.assertEqual(kv.database(VECTOR["database"]).get("facts/name"), VECTOR["sealed"])
 
     def test_with_a_key_commits_seal_each_value_under_its_own_key_and_scans_open_them(self):
-        kv, seen = client([ok({"lsn": 2})])
+        kv, seen = client([BEFORE_SLOTS, ok({"lsn": 2})])
         kv.database("memory", encryption_key=KEY).commit(
             [
                 {"op": "put", "key": "facts/a", "value": "one"},
@@ -541,14 +549,16 @@ class EncryptionTests(unittest.TestCase):
                 {"op": "delete", "key": "facts/c"},
             ]
         )
-        ops = json.loads(seen[0]["body"])["ops"]
+        ops = json.loads(seen[1]["body"])["ops"]
         self.assertEqual(ops[2], {"op": "delete", "key": b64("facts/c")})
         items = [
             {"key": ops[0]["key"], "value": ops[0]["value"], "version": "v1"},
             {"key": ops[1]["key"], "value": ops[1]["value"], "version": "v2"},
         ]
         moved = [{**items[0], "key": b64("facts/b")}]
-        reader, _ = client([ok({"items": items, "next_page_token": None}), ok({"items": moved, "next_page_token": None})])
+        reader, _ = client(
+            [ok({"items": items, "next_page_token": None}), BEFORE_SLOTS, ok({"items": moved, "next_page_token": None})]
+        )
         db = reader.database("memory", encryption_key=KEY)
         self.assertEqual(
             [(e.key, e.value, e.version) for e in db.scan(prefix="facts/")],
@@ -561,10 +571,79 @@ class EncryptionTests(unittest.TestCase):
         from edgekv._crypto import ValueCipher
 
         cipher = ValueCipher(KEY, "counters")
-        kv, seen = client([(200, {"x-edgekv-version": "v7"}, cipher.seal(b"hits", b"41")), ok({"lsn": 8})])
+        kv, seen = client([(200, {"x-edgekv-version": "v7"}, cipher.seal(b"hits", b"41")), BEFORE_SLOTS, ok({"lsn": 8})])
         kv.database("counters", encryption_key=KEY).update("hits", lambda current: str(int(current) + 1))
-        self.assertEqual(seen[1]["headers"]["If-Match"], "v7")
-        self.assertEqual(cipher.open(b"hits", seen[1]["body"]), b"42")
+        self.assertEqual(seen[2]["headers"]["If-Match"], "v7")
+        self.assertEqual(cipher.open(b"hits", seen[2]["body"]), b"42")
+
+
+#: A key id and a key slot computed by an independent implementation; the
+#: library and the TypeScript client check the same.
+SLOT_VECTOR = {
+    "id": "4110f1a6725b07a0",
+    "wrapped": "a0a1a2a3a4a5a6a7a8a9aaabdc7aaa8c9933147a78d629cf202723244d8f016c97bfb6746c01016aadbf1dd32457e5dff8609a792135357656d81992",
+    "data_key": bytes(0xD0 + (i % 16) for i in range(32)),
+}
+
+
+@unittest.skipUnless(HAVE_CRYPTOGRAPHY, 'needs pip install "valkv-edgekv[encryption]"')
+class KeySlotTests(unittest.TestCase):
+    def fails(self, code, status=None):
+        return ErrorCode(self, code, status)
+
+    def test_key_ids_and_key_slots_are_in_the_library_format(self):
+        from edgekv._crypto import key_id, unwrap_data_key, wrap_data_key
+
+        self.assertEqual(key_id(KEY), SLOT_VECTOR["id"])
+        self.assertEqual(key_id(KEY.hex()), SLOT_VECTOR["id"])
+        slot = {"id": SLOT_VECTOR["id"], "wrapped": SLOT_VECTOR["wrapped"]}
+        self.assertEqual(unwrap_data_key([slot], KEY, "agent-memory"), SLOT_VECTOR["data_key"])
+        self.assertIsNone(unwrap_data_key([slot], KEY, "other-db"))
+        self.assertIsNone(unwrap_data_key([slot], OTHER_KEY, "agent-memory"))
+        made = wrap_data_key(SLOT_VECTOR["data_key"], OTHER_KEY, "agent-memory")
+        self.assertEqual(unwrap_data_key([slot, made], OTHER_KEY, "agent-memory"), SLOT_VECTOR["data_key"])
+
+    def test_a_new_encrypted_database_gets_a_data_key_and_a_recovery_key_that_opens_it(self):
+        from edgekv._crypto import ValueCipher, key_id, unwrap_data_key
+
+        kv, seen = client([ok({"slots": [], "lsn": 0}), ok({}), ok({"lsn": 1})])
+        db = kv.database("vault", encryption_key=KEY)
+        db.put("pin", "1234")
+        self.assertEqual((seen[1]["method"], seen[1]["url"].path), ("PUT", "/v1/db/vault/keys"))
+        sent = json.loads(seen[1]["body"])
+        self.assertEqual(sent["expected"], [])
+        recovery = db.take_recovery_key()
+        self.assertEqual(len(recovery), 64)
+        self.assertIsNone(db.take_recovery_key(), "given out once")
+        self.assertEqual([s["id"] for s in sent["slots"]], [key_id(KEY), key_id(recovery)])
+
+        # Another client opens it with the recovery key alone.
+        data_key = unwrap_data_key(sent["slots"], KEY, "vault")
+        sealed = ValueCipher(data_key, "vault").seal(b"pin", b"1234")
+        other, _ = client([(200, {}, sealed), ok({"slots": sent["slots"], "lsn": 1})])
+        self.assertEqual(other.database("vault", encryption_key=recovery).get_text("pin"), "1234")
+        stranger, _ = client([(200, {}, sealed), ok({"slots": sent["slots"], "lsn": 1})])
+        with self.fails("INVALID_ENCRYPTION_KEY"):
+            stranger.database("vault", encryption_key=OTHER_KEY).get("pin")
+
+    def test_keys_are_added_and_removed_against_the_slots_as_last_read(self):
+        from edgekv._crypto import key_id, wrap_data_key
+
+        mine = wrap_data_key(SLOT_VECTOR["data_key"], KEY, "vault")
+        state = ok({"slots": [mine], "lsn": 3})
+        kv, seen = client([state, state, ok({}), state])
+        db = kv.database("vault", encryption_key=KEY)
+        self.assertEqual(db.add_key(OTHER_KEY), key_id(OTHER_KEY))
+        put = json.loads(seen[2]["body"])
+        self.assertEqual(put["expected"], [mine])
+        self.assertEqual([s["id"] for s in put["slots"]], [key_id(KEY), key_id(OTHER_KEY)])
+        # As last read, it is the only key: it stays.
+        with self.fails("UNSUPPORTED"):
+            db.remove_key(key_id(KEY))
+        self.assertEqual(len(seen), 4)
+        plain, _ = client([])
+        with self.fails("UNSUPPORTED"):
+            plain.database("p").add_key(KEY)
 
 
 class WithoutCryptographyTests(unittest.TestCase):

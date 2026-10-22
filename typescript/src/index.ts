@@ -11,9 +11,9 @@
  * and installed with this package. See `local.ts`.
  */
 
-import { ValueCipher } from './crypto.js';
+import { ValueCipher, encryptionKeyBytes, keyId, newKey, unwrapDataKey, wrapDataKey, type KeySlot } from './crypto.js';
 
-export { ENCRYPTION_OVERHEAD } from './crypto.js';
+export { ENCRYPTION_OVERHEAD, keyId, newKey, type KeySlot } from './crypto.js';
 
 /** A value to store: bytes, or text, which is stored as UTF-8. */
 export type Value = Uint8Array | string;
@@ -427,17 +427,146 @@ export interface DatabaseOptions {
 
 /** One database's contents. Get one from `EdgeKV.database(name)`. */
 export class Database {
+  /** The cipher for the data key this database's key opens, once found. */
+  private cipher?: ValueCipher;
+  private resolving?: Promise<void>;
+  /** The recovery key made when this client encrypted the database, until taken. */
+  private recovery?: string;
+
   /** @internal */
   constructor(
     private readonly transport: Transport,
     /** The database's name within the account. */
     readonly name: string,
-    private readonly cipher?: ValueCipher,
+    private readonly key?: Uint8Array,
   ) {}
 
   /** True if values are encrypted here before they are sent. */
   get encrypted(): boolean {
-    return this.cipher !== undefined;
+    return this.key !== undefined;
+  }
+
+  /** Finds, once, the data key this database's key opens. */
+  private async ready(): Promise<void> {
+    if (!this.key || this.cipher) return;
+    this.resolving ??= this.resolve().finally(() => {
+      this.resolving = undefined;
+    });
+    await this.resolving;
+  }
+
+  private async keyState(): Promise<{ slots: KeySlot[]; lsn: number }> {
+    const response = await this.transport.send('GET', this.path('/keys'));
+    return (await response.json()) as { slots: KeySlot[]; lsn: number };
+  }
+
+  private async putSlots(expected: KeySlot[], slots: KeySlot[]): Promise<void> {
+    await this.transport.send('PUT', this.path('/keys'), { json: { expected, slots } });
+  }
+
+  /**
+   * Values are sealed with the database's data key; each of its keys holds a
+   * copy of it in a key slot the service keeps. A new database gets a random
+   * data key and two slots: this key's and a new recovery key's. One
+   * encrypted before key slots has none: its key is its data key.
+   */
+  private async resolve(): Promise<void> {
+    const key = this.key!;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const state = await this.keyState();
+      if (state.slots.length > 0) {
+        const dataKey = unwrapDataKey(state.slots, key, this.name);
+        if (!dataKey) {
+          throw new EdgeKVError('INVALID_ENCRYPTION_KEY', "this key is not one of the database's keys", 0);
+        }
+        this.cipher = new ValueCipher(dataKey, this.name);
+        return;
+      }
+      if (state.lsn > 0) {
+        this.cipher = new ValueCipher(key, this.name);
+        return;
+      }
+      const dataKey = encryptionKeyBytes(newKey());
+      const recovery = newKey();
+      const slots = [wrapDataKey(dataKey, key, this.name), wrapDataKey(dataKey, recovery, this.name)];
+      try {
+        await this.putSlots([], slots);
+      } catch (error) {
+        // Another client encrypted it first: read its slots.
+        if (error instanceof EdgeKVError && error.code === 'CONDITION_FAILED') continue;
+        throw error;
+      }
+      this.recovery = recovery;
+      this.cipher = new ValueCipher(dataKey, this.name);
+      return;
+    }
+    throw new EdgeKVError('UNAVAILABLE', "the database's keys kept changing while they were read", 0);
+  }
+
+  private async requireKey(): Promise<ValueCipher> {
+    if (!this.key) throw new EdgeKVError('UNSUPPORTED', 'this database was not given an encryption key', 0);
+    await this.ready();
+    return this.cipher!;
+  }
+
+  /**
+   * The recovery key made when this client encrypted a new database, the
+   * first time it is asked for, as 64 hexadecimal characters; `null` after,
+   * or if this client did not make the database. It opens the database like
+   * any of its keys. Store it where you keep secrets: if every key is lost,
+   * the data cannot be recovered, by anyone.
+   */
+  async takeRecoveryKey(): Promise<string | null> {
+    await this.ready();
+    const recovery = this.recovery ?? null;
+    this.recovery = undefined;
+    return recovery;
+  }
+
+  /** The ids of the keys that open this database. */
+  async keyIds(): Promise<string[]> {
+    const cipher = await this.requireKey();
+    const state = await this.keyState();
+    return state.slots.length > 0 ? state.slots.map((slot) => slot.id) : [keyId(cipher.dataKey)];
+  }
+
+  /**
+   * Lets `key` open this database too, and returns its id. Nothing is
+   * encrypted again. Needs an API key: an access token cannot change keys.
+   */
+  async addKey(key: Uint8Array | string): Promise<string> {
+    const cipher = await this.requireKey();
+    const id = keyId(key);
+    const state = await this.keyState();
+    if (state.slots.some((slot) => slot.id === id)) return id;
+    const slots = [...state.slots];
+    // Encrypted before key slots: its key is its data key, and gets the first slot.
+    if (slots.length === 0) slots.push(wrapDataKey(cipher.dataKey, cipher.dataKey, this.name));
+    slots.push(wrapDataKey(cipher.dataKey, key, this.name));
+    await this.putSlots(state.slots, slots);
+    return id;
+  }
+
+  /** Makes a new random key that opens this database, and returns it once. Store it where you keep secrets. */
+  async addRecoveryKey(): Promise<string> {
+    const key = newKey();
+    await this.addKey(key);
+    return key;
+  }
+
+  /** Stops the key with this id from opening the database. The last key cannot be removed. */
+  async removeKey(id: string): Promise<void> {
+    await this.requireKey();
+    const state = await this.keyState();
+    if (state.slots.length === 0) {
+      throw new EdgeKVError('UNSUPPORTED', 'this database has no key slots yet: add a key first', 0);
+    }
+    const slots = state.slots.filter((slot) => slot.id !== id);
+    if (slots.length === state.slots.length) throw new EdgeKVError('NOT_FOUND', `key ${id} not found`, 404);
+    if (slots.length === 0) {
+      throw new EdgeKVError('UNSUPPORTED', 'a database keeps at least one key: add another before removing this one', 0);
+    }
+    await this.putSlots(state.slots, slots);
   }
 
   private path(rest: string): string {
@@ -471,6 +600,7 @@ export class Database {
 
   /** The value stored under `key` and its version, or `null` if there is none. */
   async getVersioned(key: string): Promise<Versioned | null> {
+    await this.ready();
     try {
       const response = await this.transport.send('GET', this.path(`/kv/${keyPath(key)}`));
       const stored = new Uint8Array(await response.arrayBuffer());
@@ -504,6 +634,7 @@ export class Database {
    * `CONDITION_FAILED`. With `ttlSeconds` or `expiresAt`, the value expires.
    */
   async put(key: string, value: Value, options: PutOptions = {}): Promise<WriteResult> {
+    await this.ready();
     const response = await this.transport.send('PUT', this.path(`/kv/${keyPath(key)}`), {
       query: expiryFields(options),
       body: this.sealed(toBytes(key), toBytes(value)) as BodyInit,
@@ -533,6 +664,7 @@ export class Database {
    */
   async commit(operations: Operation[], options: { conditions?: Condition[] } = {}): Promise<CommitResult> {
     if (operations.length === 0) throw new EdgeKVError('BAD_REQUEST', 'a commit needs at least one operation', 0);
+    await this.ready();
     const ops = operations.map((operation) => {
       const key = toBytes(operation.key);
       return operation.op === 'put'
@@ -587,6 +719,7 @@ export class Database {
 
   /** One page of entries in key order. Most callers want `scan`. */
   async scanPage(options: ScanOptions & { pageToken?: string } = {}): Promise<Page<Entry>> {
+    await this.ready();
     const response = await this.transport.send('GET', this.path('/kv'), {
       query: { prefix: options.prefix, limit: options.pageSize, page_token: options.pageToken },
     });
@@ -771,10 +904,10 @@ export class EdgeKV {
    * before they leave this process.
    */
   database(name: string, options: DatabaseOptions = {}): Database {
-    let cipher: ValueCipher | undefined;
+    let cipher: Uint8Array | undefined;
     if (options.encryptionKey !== undefined) {
       try {
-        cipher = new ValueCipher(options.encryptionKey, name);
+        cipher = encryptionKeyBytes(options.encryptionKey);
       } catch (error) {
         throw new EdgeKVError('BAD_REQUEST', (error as Error).message, 0);
       }
