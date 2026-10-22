@@ -242,6 +242,31 @@ test('a write can require the version it read, or that the key has no value', as
   assert.equal(seen.length, 5);
 });
 
+test('a value can be given a lifetime, and reads say when it expires', async () => {
+  const at = '2026-10-18T09:30:00.000Z';
+  const { kv, seen } = client([
+    { json: { lsn: 1 } },
+    { json: { lsn: 2 } },
+    { json: { lsn: 3, versions: ['v1'] } },
+    { bytes: new TextEncoder().encode('x'), headers: { 'x-edgekv-version': 'v1', 'x-edgekv-expires': at } },
+    { json: { items: [{ key: b64('a'), value: b64('x'), version: 'v1', expires_at: at }], next_page_token: null } },
+  ]);
+  const db = kv.database('sessions');
+  await db.put('a', 'x', { ttlSeconds: 3600 });
+  assert.equal(seen[0]!.url.searchParams.get('ttl_seconds'), '3600');
+  await db.put('b', 'x', { expiresAt: new Date(at), ifAbsent: true });
+  assert.equal(seen[1]!.url.searchParams.get('expires_at'), at);
+  assert.equal(seen[1]!.headers['if-none-match'], '*');
+  await db.commit([{ op: 'put', key: 'c', value: 'x', ttlSeconds: 60 }]);
+  assert.equal(JSON.parse(seen[2]!.body as string).ops[0].ttl_seconds, 60);
+
+  assert.deepEqual((await db.getVersioned('a'))?.expiresAt, new Date(at));
+  const page = await db.scanPage();
+  assert.deepEqual(page.items[0]!.expiresAt, new Date(at));
+  await assert.rejects(db.put('d', 'x', { ttlSeconds: 5, expiresAt: at }), { code: 'BAD_REQUEST' });
+  assert.equal(seen.length, 5);
+});
+
 test('getVersioned returns the version the service sends with the value', async () => {
   const { kv } = client([{ bytes: new TextEncoder().encode('10'), headers: { 'x-edgekv-version': 'v7' } }, failure(404, 'KEY_NOT_FOUND')]);
   assert.deepEqual(await kv.database('shop').getVersioned('stock/1'), { value: new TextEncoder().encode('10'), version: 'v7' });

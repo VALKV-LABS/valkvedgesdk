@@ -20,6 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ._crypto import ENCRYPTION_OVERHEAD, ValueCipher
@@ -98,6 +99,8 @@ class Entry:
     value: bytes
     #: The value's version, when the service reports it.
     version: Optional[str] = None
+    #: When the value expires (RFC 3339), for a value that does.
+    expires_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +110,8 @@ class Versioned:
 
     value: bytes
     version: str
+    #: When the value expires (RFC 3339), for a value that does.
+    expires_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +172,21 @@ def _to_bytes(value: Value) -> bytes:
 
 def _b64(value: Value) -> str:
     return base64.b64encode(_to_bytes(value)).decode("ascii")
+
+
+def _expiry(ttl_seconds: Optional[int], expires_at: Union[None, str, datetime]) -> Dict[str, Any]:
+    """``ttl_seconds`` or ``expires_at`` for the service: at most one. A
+    ``datetime`` without a time zone is taken as UTC."""
+    if ttl_seconds is not None and expires_at is not None:
+        raise EdgeKVError("BAD_REQUEST", "give ttl_seconds or expires_at, not both", 0)
+    if ttl_seconds is not None:
+        return {"ttl_seconds": int(ttl_seconds)}
+    if isinstance(expires_at, datetime):
+        moment = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+        return {"expires_at": moment.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")}
+    if expires_at is not None:
+        return {"expires_at": expires_at}
+    return {}
 
 
 def _condition_headers(if_version: Optional[str], if_absent: bool) -> Dict[str, str]:
@@ -406,7 +426,9 @@ class Database:
             if error.code == "KEY_NOT_FOUND":
                 return None
             raise
-        return Versioned(self._opened(_to_bytes(key), value), headers.get("x-edgekv-version", ""))
+        return Versioned(
+            self._opened(_to_bytes(key), value), headers.get("x-edgekv-version", ""), headers.get("x-edgekv-expires")
+        )
 
     def get_text(self, key: str) -> Optional[str]:
         """The value as text, or ``None``."""
@@ -418,25 +440,55 @@ class Database:
         text = self.get_text(key)
         return None if text is None else json.loads(text)
 
-    def put(self, key: str, value: Value, *, if_version: Optional[str] = None, if_absent: bool = False) -> int:
+    def put(
+        self,
+        key: str,
+        value: Value,
+        *,
+        if_version: Optional[str] = None,
+        if_absent: bool = False,
+        ttl_seconds: Optional[int] = None,
+        expires_at: Union[None, str, datetime] = None,
+    ) -> int:
         """Stores a value and returns its position in the log. Returns once the
         service has made it durable.
 
         With ``if_version``, only if the key is still at that version; with
         ``if_absent``, only if it has no value. Otherwise nothing is written and
         it raises ``CONDITION_FAILED``.
+
+        With ``ttl_seconds`` (1 second to 10 years) or ``expires_at``, the
+        value expires: from then on the key reads as not there, and the service
+        deletes it. The time is stored beside the value, not encrypted with it.
         """
         reply = self._client.send_json(
             "PUT",
             self._path(f"/kv/{_key_path(key)}"),
             body=self._sealed(_to_bytes(key), _to_bytes(value)),
+            query=_expiry(ttl_seconds, expires_at),
             headers=_condition_headers(if_version, if_absent),
         )
         return int(reply["lsn"])
 
-    def put_json(self, key: str, value: Any, *, if_version: Optional[str] = None, if_absent: bool = False) -> int:
+    def put_json(
+        self,
+        key: str,
+        value: Any,
+        *,
+        if_version: Optional[str] = None,
+        if_absent: bool = False,
+        ttl_seconds: Optional[int] = None,
+        expires_at: Union[None, str, datetime] = None,
+    ) -> int:
         """Stores a value as JSON text."""
-        return self.put(key, json.dumps(value), if_version=if_version, if_absent=if_absent)
+        return self.put(
+            key,
+            json.dumps(value),
+            if_version=if_version,
+            if_absent=if_absent,
+            ttl_seconds=ttl_seconds,
+            expires_at=expires_at,
+        )
 
     def delete(self, key: str, *, if_version: Optional[str] = None) -> int:
         """Removes a key. Removing a key that is not there is not an error,
@@ -507,13 +559,14 @@ class Database:
         """
         if not operations:
             raise EdgeKVError("BAD_REQUEST", "a commit needs at least one operation", 0)
-        ops: List[Dict[str, str]] = []
+        ops: List[Dict[str, Any]] = []
         for operation in operations:
             kind = operation.get("op")
             if kind == "put":
                 key = _to_bytes(operation["key"])
                 value = self._sealed(key, _to_bytes(operation["value"]))
-                ops.append({"op": "put", "key": _b64(key), "value": _b64(value)})
+                expiry = _expiry(operation.get("ttl_seconds"), operation.get("expires_at"))
+                ops.append({"op": "put", "key": _b64(key), "value": _b64(value), **expiry})
             elif kind == "delete":
                 ops.append({"op": "delete", "key": _b64(operation["key"])})
             else:
@@ -534,7 +587,9 @@ class Database:
         for item in page["items"]:
             key_bytes = base64.b64decode(item["key"])
             value = self._opened(key_bytes, base64.b64decode(item["value"]))
-            items.append(Entry(key_bytes.decode("utf-8", "replace"), key_bytes, value, item.get("version")))
+            items.append(
+                Entry(key_bytes.decode("utf-8", "replace"), key_bytes, value, item.get("version"), item.get("expires_at"))
+            )
         return Page(items, page.get("next_page_token"))
 
     def scan(self, prefix: Optional[str] = None, page_size: Optional[int] = None) -> Iterator[Entry]:

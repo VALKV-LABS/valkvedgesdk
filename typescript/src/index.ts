@@ -98,6 +98,8 @@ export interface CommitResult extends WriteResult {
 export interface Versioned {
   value: Uint8Array;
   version: string;
+  /** When the value expires. Absent for a value that does not. */
+  expiresAt?: Date;
 }
 
 export interface Entry {
@@ -107,9 +109,22 @@ export interface Entry {
   value: Uint8Array;
   /** The value's version, when the source reports it. */
   version?: string;
+  /** When the value expires, when it does and the source reports it. */
+  expiresAt?: Date;
 }
 
-export type Operation = { op: 'put'; key: Value; value: Value } | { op: 'delete'; key: Value };
+/**
+ * A lifetime for a value: `ttlSeconds` from now (1 second to 10 years), or
+ * `expiresAt`. Give at most one. Once it has passed the key reads as not
+ * there, and the service then deletes it. The time is stored beside the
+ * value, not encrypted with it.
+ */
+export interface Expiry {
+  ttlSeconds?: number;
+  expiresAt?: Date | string;
+}
+
+export type Operation = ({ op: 'put'; key: Value; value: Value } & Expiry) | { op: 'delete'; key: Value };
 
 /** A requirement for a commit: `key` is still at `version`, or has no value when `version` is `null`. */
 export interface Condition {
@@ -123,6 +138,22 @@ export interface WriteCondition {
   ifVersion?: string;
   /** Only if the key has no value: create, never overwrite. */
   ifAbsent?: boolean;
+}
+
+/** What a put can carry: a condition, and a lifetime. */
+export interface PutOptions extends WriteCondition, Expiry {}
+
+/** `expires_at` or `ttl_seconds` for the service, checked here first. */
+function expiryFields(expiry: Expiry): { ttl_seconds?: number; expires_at?: string } {
+  if (expiry.ttlSeconds !== undefined && expiry.expiresAt !== undefined) {
+    throw new EdgeKVError('BAD_REQUEST', 'give ttlSeconds or expiresAt, not both', 0);
+  }
+  if (expiry.ttlSeconds !== undefined) return { ttl_seconds: expiry.ttlSeconds };
+  if (expiry.expiresAt !== undefined) {
+    const at = expiry.expiresAt instanceof Date ? expiry.expiresAt.toISOString() : expiry.expiresAt;
+    return { expires_at: at };
+  }
+  return {};
 }
 
 /**
@@ -443,7 +474,12 @@ export class Database {
     try {
       const response = await this.transport.send('GET', this.path(`/kv/${keyPath(key)}`));
       const stored = new Uint8Array(await response.arrayBuffer());
-      return { value: this.opened(toBytes(key), stored), version: response.headers.get('x-edgekv-version') ?? '' };
+      const expires = response.headers.get('x-edgekv-expires');
+      return {
+        value: this.opened(toBytes(key), stored),
+        version: response.headers.get('x-edgekv-version') ?? '',
+        ...(expires ? { expiresAt: new Date(expires) } : {}),
+      };
     } catch (error) {
       if (error instanceof EdgeKVError && error.code === 'KEY_NOT_FOUND') return null;
       throw error;
@@ -465,19 +501,20 @@ export class Database {
   /**
    * Stores a value. Returns once the service has made it durable. With a
    * condition that does not hold, writes nothing and fails with
-   * `CONDITION_FAILED`.
+   * `CONDITION_FAILED`. With `ttlSeconds` or `expiresAt`, the value expires.
    */
-  async put(key: string, value: Value, condition: WriteCondition = {}): Promise<WriteResult> {
+  async put(key: string, value: Value, options: PutOptions = {}): Promise<WriteResult> {
     const response = await this.transport.send('PUT', this.path(`/kv/${keyPath(key)}`), {
+      query: expiryFields(options),
       body: this.sealed(toBytes(key), toBytes(value)) as BodyInit,
-      headers: conditionHeaders(condition),
+      headers: conditionHeaders(options),
     });
     return (await response.json()) as WriteResult;
   }
 
   /** Stores a value as JSON text. */
-  putJson(key: string, value: unknown, condition: WriteCondition = {}): Promise<WriteResult> {
-    return this.put(key, JSON.stringify(value), condition);
+  putJson(key: string, value: unknown, options: PutOptions = {}): Promise<WriteResult> {
+    return this.put(key, JSON.stringify(value), options);
   }
 
   /** Removes a key. Removing a key that is not there is not an error, unless `ifVersion` is given. */
@@ -499,7 +536,12 @@ export class Database {
     const ops = operations.map((operation) => {
       const key = toBytes(operation.key);
       return operation.op === 'put'
-        ? { op: 'put', key: toBase64(key), value: toBase64(this.sealed(key, toBytes(operation.value))) }
+        ? {
+            op: 'put',
+            key: toBase64(key),
+            value: toBase64(this.sealed(key, toBytes(operation.value))),
+            ...expiryFields(operation),
+          }
         : { op: 'delete', key: toBase64(key) };
     });
     const conditions = options.conditions?.map((c) => ({ key: toBase64(toBytes(c.key)), version: c.version }));
@@ -549,7 +591,7 @@ export class Database {
       query: { prefix: options.prefix, limit: options.pageSize, page_token: options.pageToken },
     });
     const page = (await response.json()) as {
-      items: { key: string; value: string; version?: string }[];
+      items: { key: string; value: string; version?: string; expires_at?: string }[];
       next_page_token: string | null;
     };
     return {
@@ -558,6 +600,7 @@ export class Database {
         const value = this.opened(keyBytes, fromBase64(item.value));
         const entry: Entry = { key: decoder.decode(keyBytes), keyBytes, value };
         if (item.version !== undefined) entry.version = item.version;
+        if (item.expires_at !== undefined) entry.expiresAt = new Date(item.expires_at);
         return entry;
       }),
       nextPageToken: page.next_page_token,

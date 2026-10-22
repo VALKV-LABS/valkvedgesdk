@@ -80,6 +80,20 @@ await db.update('stock/widget', (value) => String(Number(new TextDecoder().decod
 Your function gets the current value (`null` if there is none) and returns the new one
 (`null` deletes the key). It may run more than once, so keep it free of side effects.
 
+### Values that expire
+
+```ts
+await db.put('session/42', token, { ttlSeconds: 3600 })        // gone in an hour
+await db.put('code/7', '123456', { expiresAt: new Date(Date.now() + 300_000) })
+await db.commit([{ op: 'put', key: 'otp/1', value: 'x', ttlSeconds: 60 }])
+(await db.getVersioned('session/42'))?.expiresAt               // a Date
+```
+
+Once its time has passed the key reads as not there, and the service then deletes it.
+A later put without `ttlSeconds` or `expiresAt` keeps the value for good. The time is
+stored beside the value, not encrypted with it. The local mode does not take a lifetime
+yet.
+
 ### Reading many keys
 
 ```ts

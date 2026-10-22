@@ -68,6 +68,19 @@ db.update("stock/widget", lambda value: str(int(value) - 1))
 Your function gets the current value (`None` if there is none) and returns the new one
 (`None` deletes the key). It may run more than once, so keep it free of side effects.
 
+### Values that expire
+
+```python
+db.put("session/42", token, ttl_seconds=3600)                  # gone in an hour
+db.put("code/7", "123456", expires_at=datetime.now(timezone.utc) + timedelta(minutes=5))
+db.commit([{"op": "put", "key": "otp/1", "value": "x", "ttl_seconds": 60}])
+db.get_versioned("session/42").expires_at                       # an RFC 3339 time
+```
+
+Once its time has passed the key reads as not there, and the service then deletes it.
+A later put without `ttl_seconds` or `expires_at` keeps the value for good. The time is
+stored beside the value, not encrypted with it.
+
 ### Reading many keys
 
 ```python
