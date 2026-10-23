@@ -14,7 +14,7 @@ napi = { version = "3", default-features = false, features = ["napi6", "async"] 
 napi-derive = "3"
 # Re-pin when the library changes.
 tokio = { version = "1", features = ["sync", "macros"] }
-valkvedge = { git = "https://github.com/VALKV-LABS/libvalkvedge", rev = "a978d61ed5e045081eaa2fb664de8a3a18079b52" }
+valkvedge = { git = "https://github.com/VALKV-LABS/libvalkvedge", rev = "d1e1670bfc0a23cf4fc10f7a37e0982384f3469e" }
 
 [build-dependencies]
 napi-build = "2"

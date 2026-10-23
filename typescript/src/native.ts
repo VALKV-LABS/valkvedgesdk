@@ -27,27 +27,44 @@ export interface NativeOpenOptions {
 }
 
 export interface NativeKv {
-  database(name: string, options?: { durability?: string; encryptionKey?: Buffer; ingest?: boolean }): Promise<NativeDb>;
+  database(
+    name: string,
+    options?: { durability?: string; encryptionKey?: Buffer; ingest?: boolean; prefixes?: Buffer[] },
+  ): Promise<NativeDb>;
   close(): Promise<void>;
+}
+
+/** A value read natively. `expiresMs`: when it expires, in milliseconds since the epoch. */
+export interface NativeVersioned {
+  value: Buffer;
+  version: string;
+  expiresMs?: number | null;
+}
+
+export interface NativeEntry {
+  key: Buffer;
+  value: Buffer;
+  expiresMs?: number | null;
 }
 
 export interface NativeDb {
   readonly name: string;
   get(key: Buffer): Buffer | null;
-  getVersioned(key: Buffer): { value: Buffer; version: string } | null;
-  fetch(key: Buffer): Promise<{ value: Buffer; version: string } | null>;
-  fetchPage(
-    prefix: Buffer,
-    limit: number,
-    pageToken?: string,
-  ): Promise<{ entries: { key: Buffer; value: Buffer }[]; nextPageToken?: string | null }>;
+  getVersioned(key: Buffer): NativeVersioned | null;
+  fetch(key: Buffer): Promise<NativeVersioned | null>;
+  fetchPage(prefix: Buffer, limit: number, pageToken?: string): Promise<{ entries: NativeEntry[]; nextPageToken?: string | null }>;
   watch(prefix: Buffer): NativeWatch;
-  scan(bounds: { prefix?: Buffer; start?: Buffer; end?: Buffer; after?: Buffer; limit?: number }): { key: Buffer; value: Buffer }[];
+  scan(bounds: { prefix?: Buffer; start?: Buffer; end?: Buffer; after?: Buffer; limit?: number }): NativeEntry[];
   commit(
-    ops: { delete: boolean; key: Buffer; value?: Buffer }[],
+    ops: { delete: boolean; key: Buffer; value?: Buffer; expiresMs?: number }[],
     durability?: string,
     conditions?: { key: Buffer; version?: string }[],
   ): Promise<{ lsn?: number | null; outboxSeq?: number | null; versions: string[] }>;
+  takeRecoveryKey(): string | null;
+  keyIds(): Promise<string[]>;
+  addKey(key: Buffer): Promise<string>;
+  addRecoveryKey(): Promise<string>;
+  removeKey(id: string): Promise<void>;
   sync(): Promise<number>;
   flush(): Promise<number>;
   status(): { appliedLsn: number; generation: number; outboxEntries: number; outboxBytes: number; diskBytes: number };

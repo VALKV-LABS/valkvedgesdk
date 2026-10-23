@@ -17,15 +17,17 @@ import {
   type Change,
   type Condition,
   type Entry,
+  type Expiry,
   type Operation,
   type Page,
+  type PutOptions,
   type TokenSource,
   type Value,
   type Versioned,
   type WriteCondition,
 } from './index.js';
 import { encryptionKeyBytes } from './crypto.js';
-import { loadNative, type NativeDb, type NativeKv, type NativeWatch } from './native.js';
+import { loadNative, type NativeDb, type NativeEntry, type NativeKv, type NativeVersioned, type NativeWatch } from './native.js';
 
 /** `'sync'`: return once the write is stored durably. `'buffered'`: return once it is on local disk. */
 export type Durability = 'sync' | 'buffered';
@@ -56,7 +58,11 @@ export interface LocalDatabaseOptions {
    * this machine, before they are written to disk or sent anywhere: the
    * service only ever holds ciphertext. `EdgeKV.database(name, { encryptionKey })`
    * reads and writes the same values remotely. Keys (the names) are not
-   * encrypted. A lost key cannot be recovered.
+   * encrypted.
+   *
+   * A new database encrypted here also gets a recovery key: take it with
+   * `takeRecoveryKey()` and store it where you keep secrets. If every key
+   * is lost, the data cannot be recovered, by anyone.
    */
   encryptionKey?: Uint8Array | string;
   /**
@@ -66,6 +72,20 @@ export interface LocalDatabaseOptions {
    * such as sensors. Needs `url`. `watch` is not available.
    */
   ingest?: boolean;
+  /**
+   * Keep and follow only keys under these prefixes (at most 16), for a copy
+   * that may see only part of a database: one team's or one user's keys.
+   * Reading or writing a key outside them fails with `NOT_REPLICATED`. Needs
+   * `url`; the service sends only these keys, and an access token can be
+   * limited to them. Opening again with other prefixes downloads the copy
+   * again.
+   */
+  prefixes?: Value[];
+}
+
+/** What a local put can carry: a durability, a condition and a lifetime. */
+export interface LocalPutOptions extends PutOptions {
+  durability?: Durability;
 }
 
 export interface LocalWriteResult {
@@ -147,6 +167,41 @@ async function callAsync<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+/** The longest lifetime a value can be given, as the service allows: 10 years. */
+const MAX_TTL_SECONDS = 10 * 365 * 86_400;
+
+/** When a put's value expires, in milliseconds since the epoch; `undefined` for never. */
+function expiresMs(expiry: Expiry): number | undefined {
+  if (expiry.ttlSeconds !== undefined && expiry.expiresAt !== undefined) {
+    throw new EdgeKVError('BAD_REQUEST', 'give ttlSeconds or expiresAt, not both', 0);
+  }
+  if (expiry.ttlSeconds !== undefined) {
+    const ttl = expiry.ttlSeconds;
+    if (!Number.isInteger(ttl) || ttl < 1 || ttl > MAX_TTL_SECONDS) {
+      throw new EdgeKVError('BAD_REQUEST', `ttlSeconds must be a whole number from 1 to ${MAX_TTL_SECONDS}`, 0);
+    }
+    return Date.now() + ttl * 1000;
+  }
+  if (expiry.expiresAt !== undefined) {
+    const at = expiry.expiresAt instanceof Date ? expiry.expiresAt.getTime() : Date.parse(expiry.expiresAt);
+    if (!Number.isFinite(at)) throw new EdgeKVError('BAD_REQUEST', 'expiresAt must be a date', 0);
+    return at;
+  }
+  return undefined;
+}
+
+function versioned(found: NativeVersioned): Versioned {
+  const value: Versioned = { value: bytes(found.value), version: found.version };
+  if (found.expiresMs != null) value.expiresAt = new Date(found.expiresMs);
+  return value;
+}
+
+function entry(found: NativeEntry): Entry {
+  const value: Entry = { key: decoder.decode(found.key), keyBytes: bytes(found.key), value: bytes(found.value) };
+  if (found.expiresMs != null) value.expiresAt = new Date(found.expiresMs);
+  return value;
+}
+
 function conditionsFor(key: Value, condition: WriteCondition): Condition[] | undefined {
   if (condition.ifVersion !== undefined && condition.ifAbsent) {
     throw new EdgeKVError('BAD_REQUEST', 'give ifVersion or ifAbsent, not both', 0);
@@ -201,8 +256,9 @@ export class LocalEdgeKV {
     } catch (error) {
       throw new EdgeKVError('BAD_REQUEST', (error as Error).message, 0);
     }
+    const prefixes = options.prefixes?.map(buf);
     const db = await callAsync(() =>
-      this.native.database(name, { durability, encryptionKey: encryptionKey && buf(encryptionKey), ingest }),
+      this.native.database(name, { durability, encryptionKey: encryptionKey && buf(encryptionKey), ingest, prefixes }),
     );
     return new LocalDatabase(db, ingest);
   }
@@ -245,7 +301,7 @@ export class LocalDatabase {
   async getVersioned(key: Value): Promise<Versioned | null> {
     if (this.ingest) return this.fetch(key);
     const found = call(() => this.native.getVersioned(buf(key)));
-    return found ? { value: bytes(found.value), version: found.version } : null;
+    return found ? versioned(found) : null;
   }
 
   /**
@@ -255,7 +311,7 @@ export class LocalDatabase {
    */
   async fetch(key: Value): Promise<Versioned | null> {
     const found = await callAsync(() => this.native.fetch(buf(key)));
-    return found ? { value: bytes(found.value), version: found.version } : null;
+    return found ? versioned(found) : null;
   }
 
   /** The value as text, or `null`. */
@@ -275,13 +331,21 @@ export class LocalDatabase {
    * at that version or has no value; otherwise nothing is written and it
    * fails with `CONDITION_FAILED`. With a service, conditions need a sync
    * write.
+   *
+   * With `ttlSeconds` or `expiresAt`, the value expires: from then on every
+   * copy reads the key as not there, by its own clock, and the database's
+   * writer deletes it. Writing the key again replaces the expiry.
    */
-  async put(key: Value, value: Value, options: { durability?: Durability } & WriteCondition = {}): Promise<LocalWriteResult> {
-    return this.commit([{ op: 'put', key, value }], { durability: options.durability, conditions: conditionsFor(key, options) });
+  async put(key: Value, value: Value, options: LocalPutOptions = {}): Promise<LocalWriteResult> {
+    const { ttlSeconds, expiresAt } = options;
+    return this.commit([{ op: 'put', key, value, ttlSeconds, expiresAt }], {
+      durability: options.durability,
+      conditions: conditionsFor(key, options),
+    });
   }
 
   /** Stores a value as JSON text. */
-  putJson(key: Value, value: unknown, options: { durability?: Durability } & WriteCondition = {}): Promise<LocalWriteResult> {
+  putJson(key: Value, value: unknown, options: LocalPutOptions = {}): Promise<LocalWriteResult> {
     return this.put(key, JSON.stringify(value), options);
   }
 
@@ -303,7 +367,7 @@ export class LocalDatabase {
     if (operations.length === 0) throw new EdgeKVError('BAD_REQUEST', 'a commit needs at least one operation', 0);
     const ops = operations.map((operation) =>
       operation.op === 'put'
-        ? { delete: false, key: buf(operation.key), value: buf(operation.value) }
+        ? { delete: false, key: buf(operation.key), value: buf(operation.value), expiresMs: expiresMs(operation) }
         : { delete: true, key: buf(operation.key) },
     );
     // The native side takes a missing version, not `null`, for "no value".
@@ -360,10 +424,7 @@ export class LocalDatabase {
       const page = await callAsync(() =>
         this.native.fetchPage(buf(options.prefix ?? ''), Math.min(limit, 200), options.pageToken),
       );
-      return {
-        items: page.entries.map((entry) => ({ key: decoder.decode(entry.key), keyBytes: bytes(entry.key), value: bytes(entry.value) })),
-        nextPageToken: page.nextPageToken ?? null,
-      };
+      return { items: page.entries.map(entry), nextPageToken: page.nextPageToken ?? null };
     }
     const page = call(() =>
       this.native.scan({
@@ -373,10 +434,7 @@ export class LocalDatabase {
       }),
     );
     const last = page.length === limit ? page[page.length - 1] : undefined;
-    return {
-      items: page.map((entry) => ({ key: decoder.decode(entry.key), keyBytes: bytes(entry.key), value: bytes(entry.value) })),
-      nextPageToken: last ? last.key.toString('base64url') : null,
-    };
+    return { items: page.map(entry), nextPageToken: last ? last.key.toString('base64url') : null };
   }
 
   /** Every entry in key order, read from local disk a page at a time. */
@@ -387,6 +445,43 @@ export class LocalDatabase {
       yield* page.items;
       pageToken = page.nextPageToken ?? undefined;
     } while (pageToken !== undefined);
+  }
+
+  /**
+   * The recovery key made when this process encrypted a new database, the
+   * first time it is asked for, as 64 hexadecimal characters; `null` after,
+   * or if this process did not make the database. It opens the database
+   * like any of its keys, here and through `EdgeKV`. Store it where you keep
+   * secrets: if every key is lost, the data cannot be recovered, by anyone.
+   */
+  takeRecoveryKey(): string | null {
+    return call(() => this.native.takeRecoveryKey()) ?? null;
+  }
+
+  /** The ids of the keys that open this database. */
+  keyIds(): Promise<string[]> {
+    return callAsync(() => this.native.keyIds());
+  }
+
+  /** Lets `key` (32 bytes, or 64 hexadecimal characters) open this database too, and returns its id. Nothing is encrypted again. */
+  async addKey(key: Uint8Array | string): Promise<string> {
+    let raw: Uint8Array;
+    try {
+      raw = encryptionKeyBytes(key);
+    } catch (error) {
+      throw new EdgeKVError('BAD_REQUEST', (error as Error).message, 0);
+    }
+    return callAsync(() => this.native.addKey(buf(raw)));
+  }
+
+  /** Makes a new random key that opens this database, and returns it once. Store it where you keep secrets. */
+  addRecoveryKey(): Promise<string> {
+    return callAsync(() => this.native.addRecoveryKey());
+  }
+
+  /** Stops the key with this id from opening the database. The last key cannot be removed. */
+  removeKey(id: string): Promise<void> {
+    return callAsync(() => this.native.removeKey(id));
   }
 
   /**

@@ -86,13 +86,12 @@ Your function gets the current value (`null` if there is none) and returns the n
 await db.put('session/42', token, { ttlSeconds: 3600 })        // gone in an hour
 await db.put('code/7', '123456', { expiresAt: new Date(Date.now() + 300_000) })
 await db.commit([{ op: 'put', key: 'otp/1', value: 'x', ttlSeconds: 60 }])
-(await db.getVersioned('session/42'))?.expiresAt               // a Date
+const expiresAt = (await db.getVersioned('session/42'))?.expiresAt   // a Date
 ```
 
 Once its time has passed the key reads as not there, and the service then deletes it.
 A later put without `ttlSeconds` or `expiresAt` keeps the value for good. The time is
-stored beside the value, not encrypted with it. The local mode does not take a lifetime
-yet.
+stored beside the value, not encrypted with it. The local mode takes the same options.
 
 ### Reading many keys
 
@@ -268,6 +267,29 @@ What other replicas write reaches the local copy in the background, about once a
 `db.sync()` pushes and pulls now; `db.status()` shows how many buffered writes are still
 waiting.
 
+### Values that expire
+
+```ts
+await db.put('session/42', token, { ttlSeconds: 3600 })
+await db.getVersioned('session/42')            // { value, version, expiresAt }
+```
+
+`ttlSeconds` and `expiresAt` work as they do on `EdgeKV`, on `put`, `putJson` and in
+`commit`. Once the time has passed, every copy reads the key as not there by its own
+clock, `scan` skips it, and the database's writer deletes it within a few seconds: the
+service for a database that follows it, this process for one that lives only here.
+
+### Part of a database
+
+```ts
+const team = await kv.database('workspace', { prefixes: ['team/a/', 'shared/'] })
+```
+
+With `prefixes`, the copy keeps and follows only keys under them, so a device holds only
+what it may see. Reading or writing another key fails with `NOT_REPLICATED`. It needs
+`url`; give the device an access token limited to the same prefixes. Opening again with
+other prefixes downloads the copy again.
+
 ### Following changes
 
 ```ts
@@ -287,16 +309,22 @@ open watch keeps the process running.
 ### Encryption
 
 ```ts
-const key = crypto.getRandomValues(new Uint8Array(32))   // keep it safe: it cannot be recovered
+const key = crypto.getRandomValues(new Uint8Array(32))
 const vault = await kv.database('vault', { encryptionKey: key })
+const recovery = vault.takeRecoveryKey()   // a new database's recovery key, once: store it
 ```
 
 Values are encrypted on this machine, before they are written to disk or sent: the
 service only ever holds ciphertext. Key names, value sizes and timestamps are not
-encrypted. Opening the database without the key, or with another key, fails with
-`INVALID_ENCRYPTION_KEY`. The key is 32 bytes or 64 hexadecimal characters, and an
-`EdgeKV` client given the same key reads and writes the same values without a copy
-(see *Encrypting values* above).
+encrypted. Opening the database with a key that is not one of its keys, or without a
+key, fails with `INVALID_ENCRYPTION_KEY`. A key is 32 bytes or 64 hexadecimal
+characters, and an `EdgeKV` client given any of the database's keys reads and writes the
+same values without a copy (see *Encrypting values* above).
+
+Keys work as they do on `EdgeKV`: `takeRecoveryKey()`, `keyIds()`, `addKey(key)`,
+`addRecoveryKey()` and `removeKey(id)`. Only the process that encrypted a new database
+gets its recovery key, and only once. If every key is lost, the data cannot be
+recovered, by anyone.
 
 ### Platforms
 
